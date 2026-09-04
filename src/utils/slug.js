@@ -20,10 +20,18 @@ export const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 export const isValidSlug = (s) => SLUG_PATTERN.test(s || '');
 
-/** Root-level slugs that would collide with application routes. */
+/**
+ * Root-level slugs that would shadow an application route.
+ *
+ * This list must match topics_reserved_root_slug in the schema. It
+ * matters more than it used to: any member can now claim a top-level
+ * name, so without it someone could create a page at /dashboard and make
+ * the dashboard unreachable for everyone.
+ */
 export const RESERVED_ROOT_SLUGS = new Set([
-  'admin', 'login', 'logout', 'api', 'assets', 'static',
-  'search', 'sitemap', 'robots', '404', '_app', 'favicon',
+  'admin', 'login', 'logout', 'register', 'signup', 'signin',
+  'dashboard', 'account', 'settings', 'api', 'assets', 'static',
+  'search', 'sitemap', 'robots', '404', '_app', 'favicon', 'u', 'user',
 ]);
 
 /** Normalise a URL path: no leading/trailing slashes, no empty segments. */

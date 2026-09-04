@@ -2,6 +2,11 @@
 
 **Stack:** React 19 (Vite SPA) · Tailwind CSS v4 · Supabase (PostgreSQL 15+/17, Auth, RLS) · Vercel
 
+**Shape:** a multi-author documentation platform. Anyone may register; every page has an
+owner and one of three access levels — private, anyone-can-view, or anyone-can-edit — and
+a private section hides everything beneath it. Administrators manage accounts and every
+page.
+
 **Priorities, in the order used to break every tie:**
 Simplicity → Security → Query performance → User experience → Scalability
 
@@ -116,32 +121,40 @@ Three tables. Not two, not seven.
 ```sql
 profiles                              -- why: RLS cannot read auth.users, and roles need a home
   id            uuid PK → auth.users(id) ON DELETE CASCADE
-  email         text
+  email         text NOT NULL
+  username      text NOT NULL UNIQUE   CHECK (3-30 chars, [a-z0-9_-])
   display_name  text
-  role          text NOT NULL DEFAULT 'viewer'  CHECK (role IN ('viewer','admin'))
-  created_at    timestamptz NOT NULL DEFAULT now()
+  role          text NOT NULL DEFAULT 'member'  CHECK (IN ('member','admin'))
+  status        text NOT NULL DEFAULT 'active'  CHECK (IN ('active','suspended'))
+  created_at / updated_at  timestamptz
 
-topics                                -- why: the documentation tree and its content
+topics                                -- why: the page tree, its content, and its access rules
   id            uuid PK DEFAULT gen_random_uuid()
   parent_id     uuid → topics(id)              -- NO ACTION on delete (see §15)
   slug          text NOT NULL   CHECK (slug ~ '^[a-z0-9]+(?:-[a-z0-9]+)*$')
   path          text NOT NULL   UNIQUE          -- DERIVED, trigger-only
   depth         int  NOT NULL   CHECK (1..8)    -- DERIVED, trigger-only
   position      int  NOT NULL DEFAULT 0         -- sibling order
+
+  owner_id      uuid NOT NULL → profiles(id)    -- MUTABLE: transfers on account deletion
+  created_by    uuid → profiles(id) ON DELETE SET NULL   -- historical author
+  updated_by    uuid → profiles(id) ON DELETE SET NULL   -- last editor
+
   title         text NOT NULL
   content       text NOT NULL DEFAULT ''        -- the Markdown
-  excerpt       text            CHECK (≤ 320)   -- meta description + search snippet
-  status        text NOT NULL DEFAULT 'draft'   CHECK (IN ('draft','published'))
-  created_by    uuid → profiles(id) ON DELETE SET NULL
-  updated_by    uuid → profiles(id) ON DELETE SET NULL
-  created_at    timestamptz NOT NULL DEFAULT now()
-  updated_at    timestamptz NOT NULL DEFAULT now()
-  published_at  timestamptz
+  excerpt       text            CHECK (≤ 320)
+
+  visibility           text NOT NULL DEFAULT 'private'
+                       CHECK (IN ('private','public','collaborative'))
+  effective_visibility text NOT NULL DEFAULT 'private'   -- DERIVED from the ancestor chain
+                       CHECK (IN ('private','public','collaborative'))
+
+  created_at / updated_at / published_at  timestamptz
   search_vector tsvector GENERATED ALWAYS AS (weighted title/excerpt/content) STORED
 
   CONSTRAINT topics_path_key            UNIQUE (path)
   CONSTRAINT topics_no_self_parent      CHECK (parent_id IS NULL OR parent_id <> id)
-  CONSTRAINT topics_reserved_root_slug  CHECK (nested OR slug NOT IN ('admin','login',…))
+  CONSTRAINT topics_reserved_root_slug  CHECK (nested OR slug NOT IN ('admin','dashboard','login',…))
 
 topic_redirects                       -- why: renaming a page must not break the internet
   old_path    text PK
@@ -149,40 +162,58 @@ topic_redirects                       -- why: renaming a page must not break the
   created_at  timestamptz NOT NULL DEFAULT now()
 ```
 
+Plus one view:
+
+```sql
+public_profiles = SELECT id, username, display_name FROM profiles
+```
+
+Pages show who wrote them, so every reader must resolve an `owner_id` to a
+username — and must not get the rest of the row. A view runs with its owner's
+privileges unless `security_invoker` is set, so it reads through profiles' RLS
+while exposing three harmless columns. The alternative, a policy letting
+everyone SELECT `profiles`, would publish every member's email address and
+account status to the world.
+
 ### Why each non-obvious column exists
 
 | Column | Justification | Would removing it hurt? |
 |---|---|---|
 | `path` | Turns "find the page at this URL" from a recursive walk into one index probe | Yes — it is the entire read-performance story |
-| `depth` | O(1) nesting guard and breadcrumb ordering with no string splitting | Mildly — derivable from `path`, but at a cost on every read |
+| `depth` | O(1) nesting guard and breadcrumb ordering with no string splitting | Mildly — derivable from `path`, at a cost on every read |
 | `position` | Authors care about reading order; alphabetical is wrong for docs | Yes |
-| `excerpt` | `<meta description>` and search snippets need prose, not raw Markdown | No, but quality drops (auto-derived fallback exists) |
-| `status` | Draft/published is the whole point of an editorial workflow | Yes |
-| `published_at` | "First published" is different from "last edited"; sitemaps and readers want both | No — nice to have |
-| `search_vector` | Generated column keeps the index perfectly in sync with zero app code | Yes, if search is wanted |
-| `updated_by` | Answers "who broke this page" in a multi-admin team | No |
+| `owner_id` | Who controls the page. Separate from `created_by` because it *transfers* when an account is deleted | Yes — it is the subject of half the policies |
+| `created_by` | Historical author. The day it differs from `owner_id` is the day you need both | No, but authorship is then unrecoverable |
+| `updated_by` | On a page anyone can edit, the last editor is routinely not the owner | No — but "who changed this" is the first question asked |
+| `visibility` | The owner's stated intent | Yes |
+| `effective_visibility` | That intent **after** the ancestor rule is applied. The only access column RLS reads | Yes — without it every policy walks the tree |
+| `excerpt` | `<meta description>` and search snippets need prose, not raw Markdown | No (auto-derived fallback exists) |
+| `username` | Bylines and the people table need a stable public handle that is not an email | No, but you would be printing email addresses |
+| `status` | A reversible ban that keeps a member's content | No — but then the only moderation tool is deletion |
+| `search_vector` | Generated column keeps the index in sync with zero application code | Yes, if search is wanted |
 
 ### Explicitly rejected
 
-- **A separate `content` / `topic_versions` table.** Content is 1:1 with a topic and always
-  fetched with it. Splitting it means a join on the hottest query for no benefit. Versioning
-  is deliberately out of scope for the MVP (§19 of the brief; see §22 here).
-- **`tags`, `categories`, `authors` tables.** Nothing in the requirements needs them.
-- **A `soft_deleted_at` column.** `status='draft'` already provides "make it disappear
-  without losing it", which is what soft delete is usually reaching for.
+- **A `permissions` or `topic_shares` table.** Per-user grants ("Alice may edit
+  this one page") would need it. Three global levels do not, and adding the
+  table would put a join on the hot read path to answer a question nobody asked.
+- **A separate `content` table.** Content is 1:1 with a page and always fetched
+  with it. Splitting it adds a join to the hottest query for nothing.
+- **A `soft_deleted_at` column.** `visibility='private'` already provides "make
+  it disappear without losing it".
+- **Storing `is_private` as a boolean plus a separate `is_editable`.** Two
+  booleans give four states, one of which (private *and* world-editable) is
+  incoherent. One three-valued column cannot express it.
 
 ### ID type: `uuid`, not `bigint`
 
-Chosen because Supabase Auth identifies users by uuid (so `created_by` matches without a
-translation layer) and because a leaked sequential id is an information leak — it tells you
-how many pages exist and lets you enumerate them.
-
-The usual counter-argument is real: random v4 uuids scatter B-tree inserts and are 16 bytes
-instead of 8. At documentation scale — thousands of rows, not billions — that is noise.
-**And it costs nothing here anyway, because ids never appear in a URL** (§6); the public
-key is `path`.
-
----
+Supabase Auth identifies users by uuid, so `owner_id`, `created_by` and
+`updated_by` all match without a translation layer. A leaked sequential id is
+also an information leak — it tells you how many pages exist and lets you
+enumerate them, which matters far more now that some of those pages are
+private. The usual counter-argument (random v4 uuids scatter B-tree inserts, 16
+bytes vs 8) is real and irrelevant at documentation scale — and costs nothing
+here anyway, because ids never appear in a URL (§6).
 
 ## 4. ER diagram
 
@@ -192,32 +223,44 @@ key is `path`.
                         │  id (uuid) PK       │
                         └──────────┬──────────┘
                                    │ 1:1, ON DELETE CASCADE
-                                   │ populated by the on_auth_user_created trigger
+                                   │ populated by on_auth_user_created;
+                                   │ ALWAYS ('member','active') — which is why
+                                   │ open registration cannot mint an admin
                                    ▼
-                        ┌─────────────────────┐
-                        │      profiles       │
-                        │  id (uuid) PK/FK    │
-                        │  role  viewer|admin │──────┐
-                        └──────────┬──────────┘      │ every RLS policy in the
-                                   │                 │ system resolves through
-                    created_by ────┤                 │ public.is_admin(), which
-                    updated_by ────┤ 1:N             │ reads this one column
-                                   │ ON DELETE SET NULL
-                                   ▼                 │
-    ┌──────────────────────────────────────────┐     │
-    │                 topics                   │◄────┘
+                        ┌─────────────────────┐        ┌──────────────────────┐
+                        │      profiles       │───────►│   public_profiles    │
+                        │  id (uuid) PK/FK    │  view  │  id, username,       │
+                        │  username  UNIQUE   │        │  display_name        │
+                        │  role    member|admin │      │  (world-readable)    │
+                        │  status  active|suspended │  └──────────────────────┘
+                        └──────────┬──────────┘
+                                   │  is_admin()  reads role
+                                   │  is_active() reads status
+                                   │  — every policy in the system
+                                   │    resolves through these two
+                    owner_id  ─────┤ 1:N  (NOT NULL, no delete action:
+                    created_by ────┤       admin_delete_user reassigns first)
+                    updated_by ────┤ 1:N  ON DELETE SET NULL
+                                   ▼
+    ┌──────────────────────────────────────────┐
+    │                 topics                   │
     │  id (uuid) PK                            │
     │  parent_id (uuid) FK ────────┐           │
-    │  slug, title, content        │ SELF-     │
-    │  path  UNIQUE   (derived)    │ REFERENCE │
-    │  depth          (derived)    │ 1:N       │
-    │  position, status            │ NO ACTION │
+    │  owner_id, created_by,       │ SELF-     │
+    │  updated_by                  │ REFERENCE │
+    │  slug, title, content        │ 1:N       │
+    │  path  UNIQUE   (derived)    │ NO ACTION │
+    │  depth          (derived)    │           │
+    │  visibility                  │           │
+    │  effective_visibility (derived from      │
+    │                        the ancestor chain)│
     │  search_vector  (generated)  │           │
     └──────────┬───────────────────┴───────────┘
                │        ▲                 │
                │        └─────────────────┘
-               │  a topic's parent is another topic;
-               │  NULL parent = a root section.
+               │  a page's parent is another page;
+               │  NULL parent = a root section, which
+               │  any active member may create.
                │  Arbitrary depth, capped at 8 by CHECK.
                │
                │ 1:N, ON DELETE CASCADE
@@ -225,23 +268,25 @@ key is `path`.
     ┌──────────────────────────────┐
     │       topic_redirects        │
     │  old_path (text) PK          │   written only by trigger;
-    │  topic_id (uuid) FK          │   points at the topic, never at
+    │  topic_id (uuid) FK          │   points at the page, never at
     └──────────────────────────────┘   another path — so no chains
 ```
 
 ### Relationships in words
 
-1. **auth.users → profiles (1:1).** A trigger mirrors each signup. The mirror exists
-   because RLS policies run as `anon`/`authenticated`, which cannot read `auth.users`,
-   and because the application role needs somewhere to live that is not the JWT.
-2. **profiles → topics (1:N, twice).** `created_by` and `updated_by`. `ON DELETE SET NULL`:
-   removing a person must not remove their documentation.
-3. **topics → topics (1:N, self-referencing).** The hierarchy. `NULL` parent means a root
-   section. `ON DELETE NO ACTION` is load-bearing — see §15.
-4. **topics → topic_redirects (1:N).** Every historical URL for a topic. Cascade on delete:
-   a deleted page's old URLs should 404, not redirect into a void.
-
----
+1. **auth.users → profiles (1:1).** A trigger mirrors each signup, because RLS
+   policies run as `anon`/`authenticated` and those roles cannot read
+   `auth.users`. The trigger never reads a role from the signup payload.
+2. **profiles → public_profiles (view).** The only projection the world sees.
+3. **profiles → topics (1:N, three times).** `owner_id` (who controls it),
+   `created_by` (who wrote it), `updated_by` (who touched it last). Only
+   `owner_id` is NOT NULL, and it deliberately has no `ON DELETE` action:
+   `admin_delete_user()` must reassign the pages *before* the profile row goes,
+   which is what makes "removing a person keeps their documentation" an
+   invariant rather than a hope.
+4. **topics → topics (1:N, self-referencing).** The hierarchy, and the channel
+   the visibility rule propagates along.
+5. **topics → topic_redirects (1:N).** Every historical URL for a page.
 
 ## 5. The hierarchical data model
 
@@ -400,165 +445,337 @@ the new one (§23, admin tests 13 and 15).
 
 ---
 
-## 7. Authentication and authorization
+## 7. Access model: accounts, visibility, and inheritance
 
 ### Authentication — Supabase Auth (GoTrue)
 
-The project owner creates administrator accounts from the Supabase dashboard. Signup
-produces a `profiles` row with `role = 'viewer'` via a `SECURITY DEFINER` trigger that
-**never reads a role from the signup payload** — which is why self-signup cannot mint an
-admin. The owner promotes an account with one statement:
+Registration is open. Anyone may create an account at `/register`; the signup
+trigger writes `('member','active')` and **never reads a role from the
+payload**, so posting `{"role":"admin"}` to the signup endpoint achieves exactly
+nothing. The first administrator is promoted once, by hand:
 
 ```sql
 update public.profiles set role = 'admin' where email = 'you@example.com';
 ```
 
-Public readers are never authenticated. There is no session, no cookie, no token.
+After that, administrators promote each other through `admin_set_role()`.
+Reading the site never requires an account.
 
-### Authorization — Row Level Security, and nothing else
+### The three visibility levels
+
+| Setting | Who reads | Who edits | Who renames, moves, deletes |
+|---|---|---|---|
+| **private** | owner + admins | owner + admins | owner + admins |
+| **public** | everyone | owner + admins | owner + admins |
+| **collaborative** | everyone | **any active member** | owner + admins |
+
+One three-valued column, not a pair of switches. The obvious alternative —
+keeping `draft/published` and adding a sharing level beside it — produces six
+states, two of which ("published but private", "draft but world-editable") are
+incoherent and have to be explained away in the UI. Collapsing them loses
+nothing: *draft* and *private* were always the same idea.
+
+### Inheritance: the most restrictive ancestor wins
+
+A private section hides its entire subtree, whatever the children say.
+
+This is not a nicety. URLs here are paths. If `/research` were private but
+`/research/notes` were public, a visitor could open `/research/notes` and then
+be shown a breadcrumb to `/research` that 404s for them. "Private" has to mean
+the whole subtree or it means nothing.
 
 ```
-                       ┌────────────────────────────────────────┐
-   anon key            │  Postgres role: anon                   │
-   (no JWT)      ────► │  GRANT: SELECT on topics only          │
-                       │  RLS:   status = 'published'           │
-                       └────────────────────────────────────────┘
+        visibility          effective_visibility
+vault     private      →      private
+ └ notes  public       →      private     ← the parent wins
+    └ deep public      →      private     ← and keeps winning, all the way down
+ └ secret private      →      private
 
-   anon key            ┌────────────────────────────────────────┐
-   + user JWT    ────► │  Postgres role: authenticated          │
-   (role=viewer)       │  GRANT: SELECT/INSERT/UPDATE/DELETE    │
-                       │  RLS:   published rows only;           │
-                       │         is_admin() = false → 0 rows    │
-                       └────────────────────────────────────────┘
+  ... then the owner opens the vault:
 
-   anon key            ┌────────────────────────────────────────┐
-   + user JWT    ────► │  Postgres role: authenticated          │
-   (role=admin)        │  RLS:   is_admin() = true → all rows,  │
-                       │         full write                     │
-                       └────────────────────────────────────────┘
+vault     public       →      public
+ └ notes  public       →      public      ← restored to its own setting
+    └ deep public      →      public
+ └ secret private      →      private     ← still private on its own merit
 ```
 
-**Two independent locks, not one.** Supabase's default privileges grant `anon` full DML on
-new public tables and lean entirely on RLS. This project revokes that and grants `anon`
-`SELECT` only, so an anonymous `INSERT` fails at the *privilege* layer before a policy is
-consulted. If a policy is ever mis-written, the grant still holds.
+Note what does **not** propagate. A collaborative page under a merely *public*
+parent stays collaborative. Only `private` travels downward, because only
+`private` is a statement about who may *see* the subtree; edit rights are a
+per-page decision.
 
-### `is_admin()` — why its definition matters
+### How the rule is enforced: materialisation, not recursion
+
+`effective_visibility` is computed by trigger and stored, exactly like `path`:
 
 ```sql
-create or replace function public.is_admin() returns boolean
-language sql stable security definer set search_path = ''
-as $$ select exists (select 1 from public.profiles p
-                     where p.id = (select auth.uid()) and p.role = 'admin'); $$;
+effective_visibility := CASE WHEN parent.effective_visibility = 'private'
+                             THEN 'private' ELSE visibility END
 ```
 
-Four details, each load-bearing:
+Because the parent's value is already correct, each row needs only its parent —
+no ancestor walk. When a section's visibility changes, an `AFTER` trigger walks
+*down* one level at a time with a recursive CTE:
 
-1. **`SECURITY DEFINER`** — a policy on `topics` that reads `profiles` would otherwise be
-   subject to `profiles`' own RLS. If `profiles`' policy ever referenced `topics`, you get
-   infinite recursion (`42P17`), a classic Supabase failure. Running as owner side-steps
-   RLS on the lookup entirely.
-2. **`set search_path = ''`** — without it, a caller can create a temp table named
-   `profiles` and impersonate an admin. This is *the* `SECURITY DEFINER` escalation hole.
-3. **`STABLE`** — lets PostgreSQL evaluate it once per statement instead of once per row.
-4. **`(select auth.uid())`** — wrapping in a subquery lets the planner cache it as an
-   InitPlan; this is Supabase's documented RLS performance idiom.
+```sql
+with recursive sub as (
+  select c.id, case when NEW.effective_visibility = 'private'
+                    then 'private' else c.visibility end as eff
+  from topics c where c.parent_id = NEW.id
+  union all
+  select c.id, case when s.eff = 'private' then 'private' else c.visibility end
+  from topics c join sub s on c.parent_id = s.id
+)
+update topics t set effective_visibility = sub.eff from sub where t.id = sub.id;
+```
+
+The alternative — testing every ancestor of every descendant — is `O(depth)`
+per row and cannot use an index, because the pattern side of
+`descendant.path LIKE ancestor.path || '/%'` is the column. Walking down uses
+`(parent_id, position)` and touches each row once.
+
+The payoff is in the policies: they read **one column** and never touch the
+tree. A page's access check is a single indexed comparison, not a recursive CTE
+evaluated per row of every read.
+
+### Authorization — four actors
+
+```
+   anon key            ┌────────────────────────────────────────┐
+   (no JWT)      ────► │  Postgres role: anon                   │
+                       │  GRANT: SELECT on topics only          │
+                       │  RLS:   effective_visibility <> 'private'│
+                       └────────────────────────────────────────┘
+
+   + JWT               ┌────────────────────────────────────────┐
+   (member,      ────► │  reads the above, plus pages they own   │
+    active)            │  creates pages they will own            │
+                       │  edits any collaborative page (text only)│
+                       │  edits + deletes their own              │
+                       └────────────────────────────────────────┘
+
+   + JWT               ┌────────────────────────────────────────┐
+   (member,      ────► │  is_active() = false                    │
+    suspended)         │  → exactly an anonymous reader,         │
+                       │    while keeping every page they wrote  │
+                       └────────────────────────────────────────┘
+
+   + JWT               ┌────────────────────────────────────────┐
+   (admin)       ────► │  every row, plus the admin_* functions  │
+                       └────────────────────────────────────────┘
+```
+
+**Two independent locks, not one.** Supabase's default privileges grant `anon`
+full DML on new public tables and lean entirely on RLS. This project revokes
+that and grants `anon` `SELECT` only, so an anonymous `INSERT` fails at the
+*privilege* layer before a policy is consulted. If a policy is ever mis-written,
+the grant still holds.
+
+### The three helper functions
+
+```sql
+is_admin()        role = 'admin' AND status = 'active'   -- a suspended admin is not an admin
+is_active()       status = 'active'                      -- the gate on every write
+can_edit(topic)   admin, OR owner, OR effectively collaborative
+```
+
+All three are `SECURITY DEFINER` with `SET search_path = ''`, and both
+properties are load-bearing:
+
+1. **`SECURITY DEFINER`** — a policy on `topics` that reads `profiles` would
+   otherwise be subject to profiles' own RLS, and the moment two tables'
+   policies reference each other you get infinite recursion (`42P17`), a classic
+   Supabase failure. Running as the owner side-steps it.
+2. **`search_path = ''`** — without it, a caller can create a temp table named
+   `profiles` and impersonate an administrator. This is *the* `SECURITY DEFINER`
+   escalation hole.
+3. **`STABLE`** — evaluated once per statement rather than once per row.
+4. **`(select auth.uid())`** — wrapping in a subquery lets the planner cache it
+   as an InitPlan; Supabase's documented RLS performance idiom.
+
+### Suspension: a ban that keeps the content
+
+`admin_set_status(user, 'suspended')` flips one column. `is_active()` stops
+returning true, so every write policy declines — and nothing else changes. The
+account exists, every page it owns stays exactly as published, and reactivating
+restores everything in one click.
+
+This is deliberately the *first* moderation tool offered, ahead of deletion. The
+problem is almost always "this person must stop changing things", not "this
+person and their work must cease to exist".
 
 ### Anti-escalation
 
-A user cannot grant themselves `admin` because:
+A member cannot grant themselves anything, because:
 
-- `profiles` has **no INSERT, UPDATE or DELETE policy at all** — the table is read-only
-  through the API.
-- `authenticated` is granted `SELECT` on `profiles` and nothing else.
-- A `profiles_guard_role()` trigger rejects any role change when `auth.uid()` is non-NULL
-  (i.e. a real end-user request), while leaving service-role and SQL-editor updates free.
+- `profiles` has no INSERT or DELETE policy, and its UPDATE policy covers only
+  their own row.
+- `profiles_guard()` rejects any change to `role`, `status`, `id` or `email`
+  from a request carrying an end-user JWT — so the only field that UPDATE policy
+  actually opens is `display_name`.
+- `role` and `status` are writable only through `admin_set_role()` /
+  `admin_set_status()`, which check `is_admin()` on their first line.
+- `authenticated` is granted `SELECT, UPDATE` on `profiles` and nothing more.
 
-Three locks for one attack. Verified: an authenticated viewer attempting
-`update profiles set role='admin' where id = <self>` gets `permission denied for table
-profiles` (§23, test 19).
+### The collaborative-edit trap
+
+This is the one place where a permissive policy, alone, would be a hole.
+
+"Any active member may update this row" also permits setting `owner_id` to
+yourself, flipping `visibility` to private, renaming the URL, or moving the page
+into your own section — a hostile takeover wearing an edit's clothing. `WITH
+CHECK` cannot stop it, because **a policy cannot see the OLD row**.
+
+`topics_before_write()` closes it: when the caller is neither the owner nor an
+administrator, a request that would change `owner_id`, `visibility`, `slug` or
+`parent_id` is refused outright:
+
+> You can edit the text of a shared page, but only its owner can rename it,
+> move it, or change who may see it
+
+It compares against `OLD` rather than blanket-rejecting those columns, so an
+ordinary save that echoes back unchanged values still goes through. And it
+*refuses* rather than silently reverting — a guest who somehow submits a rename
+should be told no, not shown "saved" over a change that did not happen.
 
 ### The frontend's role in authorization: none
 
-`useAuth().isAdmin` controls what *renders*. `RequireAdmin` controls which route *mounts*.
-Neither controls what the database *permits*. Deleting both from the bundle changes the UI
-and changes nothing about access — a non-admin who forces the admin dashboard to render
-watches every request return zero rows. That is the test: **if removing the frontend check
-grants no new capability, the check was never the security control.**
-
----
+`isAdmin`, `canWrite` and `canEdit` decide what the UI *renders*.
+`RequireMember` decides which route *mounts*. None of them decide what the
+database *permits*. Delete all of them from the bundle and a member still sees
+non-private pages plus their own, and every write they attempt is still refused.
+That is the test: **if removing the frontend check grants no new capability, the
+check was never the security control.**
 
 ## 8. RLS policies
 
 ```sql
--- ── topics ───────────────────────────────────────────────────────────────
--- Two SELECT policies rather than one with an OR. Permissive policies are
--- OR'ed anyway, and splitting them means the anonymous path never calls
--- is_admin() at all — no function call, no profiles lookup, for the 99%
--- of traffic that is a logged-out reader.
-create policy "topics: anyone reads published" on public.topics
-  for select to anon, authenticated  using (status = 'published');
+-- ── topics: SELECT ───────────────────────────────────────────────────────
+-- Three permissive policies, OR'ed. Split rather than combined into one
+-- expression so the anonymous path is a bare column comparison that never
+-- calls a function or touches profiles — the shape of 99% of the traffic.
+create policy "topics: anyone reads what is not private" on public.topics
+  for select to anon, authenticated  using (effective_visibility <> 'private');
+
+create policy "topics: owners read their own" on public.topics
+  for select to authenticated        using (owner_id = (select auth.uid()));
 
 create policy "topics: admins read everything" on public.topics
   for select to authenticated        using ((select public.is_admin()));
 
-create policy "topics: admins insert" on public.topics
-  for insert to authenticated   with check ((select public.is_admin()));
+-- ── topics: INSERT ───────────────────────────────────────────────────────
+-- can_edit(parent_id) is the whole rule:
+--   parent NULL -> creating at the shared root; any active member may.
+--   otherwise   -> you must own the parent, or it must be collaborative.
+--                  You cannot drop a page into someone else's private section.
+create policy "topics: members create what they will own" on public.topics
+  for insert to authenticated with check (
+    (select public.is_active())
+    and owner_id = (select auth.uid())
+    and (select public.can_edit(parent_id))
+  );
 
--- USING gates which rows you may target; WITH CHECK gates what the row may
--- become. Both are specified: WITH CHECK is what stops an admin-scoped
--- UPDATE from writing a row that would fall outside the policy.
-create policy "topics: admins update" on public.topics
+create policy "topics: admins create anywhere" on public.topics
+  for insert to authenticated with check ((select public.is_admin()));
+
+-- ── topics: UPDATE ───────────────────────────────────────────────────────
+create policy "topics: owners update their own" on public.topics
+  for update to authenticated
+  using      (owner_id = (select auth.uid()) and (select public.is_active()))
+  with check (owner_id = (select auth.uid()));
+
+-- The dangerous one. See §7, "The collaborative-edit trap": on its own this
+-- would permit a takeover, and topics_before_write() is what closes it.
+create policy "topics: members update collaborative pages" on public.topics
+  for update to authenticated
+  using      (effective_visibility = 'collaborative' and (select public.is_active()))
+  with check (effective_visibility = 'collaborative');
+
+create policy "topics: admins update everything" on public.topics
   for update to authenticated
   using ((select public.is_admin())) with check ((select public.is_admin()));
 
-create policy "topics: admins delete" on public.topics
-  for delete to authenticated        using ((select public.is_admin()));
+-- ── topics: DELETE ───────────────────────────────────────────────────────
+-- Note what is ABSENT: there is no collaborative delete policy. "Anyone can
+-- edit" is an invitation to contribute, not permission to destroy.
+create policy "topics: owners delete their own" on public.topics
+  for delete to authenticated
+  using (owner_id = (select auth.uid()) and (select public.is_active()));
+
+create policy "topics: admins delete anything" on public.topics
+  for delete to authenticated using ((select public.is_admin()));
 
 -- ── profiles ─────────────────────────────────────────────────────────────
--- SELECT only. No write policy exists, by design.
-create policy "profiles: read own"        on public.profiles
+-- Readable only by its owner and by administrators; the world gets the
+-- public_profiles view instead, which carries no email, role or status.
+create policy "profiles: read your own"    on public.profiles
   for select to authenticated using (id = (select auth.uid()));
-create policy "profiles: admins read all" on public.profiles
+create policy "profiles: admins read all"  on public.profiles
   for select to authenticated using ((select public.is_admin()));
 
+-- Not a hole: profiles_guard() rejects any change to role, status, id or
+-- email from an end-user JWT, so the only field this opens is display_name.
+create policy "profiles: edit your own display name" on public.profiles
+  for update to authenticated
+  using (id = (select auth.uid())) with check (id = (select auth.uid()));
+
 -- ── topic_redirects ──────────────────────────────────────────────────────
--- World-readable: a redirect reveals only that a URL moved. Resolving one
--- still fetches the target through the topics policies, so a redirect that
--- points at a draft yields 404 for anonymous visitors rather than leaking it.
--- No write policy: rows come only from the SECURITY DEFINER trigger.
-create policy "redirects: world readable" on public.topic_redirects
-  for select to anon, authenticated using (true);
+-- A redirect is visible only if its TARGET is. The EXISTS is evaluated with
+-- the topics policies applied, so a redirect pointing at a private page
+-- simply is not there — rather than resolving to a 404 and thereby
+-- confirming that the page exists.
+create policy "redirects: visible when the target is" on public.topic_redirects
+  for select to anon, authenticated
+  using (exists (select 1 from public.topics t where t.id = topic_id));
 ```
 
-### Function execution grants
+### A consequence worth knowing
 
-`get_page`, `search_topics`, `slugify` → `anon, authenticated`.
-`move_topic`, `delete_topic`, `reorder_siblings`, `descendant_count` → `authenticated` only.
+An owner deleting a subtree that contains a page **someone else** created inside
+their collaborative folder will find the delete blocked by the foreign key: the
+other person's row is invisible to the DELETE and survives it, leaving a child
+with no parent. That is the correct outcome — it fails loudly instead of quietly
+destroying a contributor's work.
 
-All of them are `SECURITY INVOKER` (the default). **This is the important part**: the write
-RPCs are *not* a privilege escalation path. They exist for atomicity and validation, and
-every statement inside them is still filtered by the `topics` policies. A viewer who calls
-`delete_topic()` deletes zero rows — confirmed in §23, test 18.
+### Administrator functions
 
----
+`admin_set_role`, `admin_set_status`, `admin_delete_user` and `admin_list_users`
+are `SECURITY DEFINER`, because each does something an `authenticated` caller
+genuinely cannot: write a column no policy exposes, or delete from
+`auth.users`. That makes **the first line of each body the actual access
+control** — a `SECURITY DEFINER` function without an internal check is a
+privilege-escalation endpoint with a friendly name.
+
+Two invariants are enforced on top of `is_admin()`, because losing either leaves
+the installation unadministrable:
+
+1. You cannot demote, suspend or delete **yourself**.
+2. You cannot remove the **last active administrator**.
+
+`admin_delete_user()` transfers the departing member's pages to the acting
+administrator before deleting the profile — ordering that is forced by
+`owner_id` being NOT NULL with no delete action, and that turns "removing a
+person keeps their documentation" into something the schema guarantees rather
+than something the code remembers to do.
 
 ## 9. Indexes — exactly five
 
-Two more come free from constraints: `topics_path_key UNIQUE (path)` and
-`topic_redirects_pkey (old_path)`. Between them they serve the two hottest reads in the
-system, which is why the list below is short.
+Four more come free from constraints: `topics_path_key UNIQUE (path)`,
+`topic_redirects_pkey (old_path)`, `profiles_pkey (id)` and
+`profiles_username_key (username)`. Between them they serve the two hottest
+reads in the system, which is why the list below is short.
 
 | # | Index | Optimises | Why it cannot be skipped |
 |---|---|---|---|
 | — | `topics_path_key UNIQUE (path)` | page lookup `path = $1`; breadcrumbs `path IN (…)` | the workhorse; also enforces sibling-slug uniqueness |
 | 1 | `topics_path_prefix_idx (path text_pattern_ops)` | subtree scans `path LIKE 'x/%'` — move cascade, subtree delete, `descendant_count` | **the unique index cannot serve this.** Supabase DBs use a non-C collation (`en_US.UTF-8`), and a btree in a non-C collation is unusable for prefix `LIKE`. `text_pattern_ops` rebuilds it with C-style byte ordering |
-| 2 | `topics_parent_position_idx (parent_id, position)` | children ordered by sibling position; admin tree; `reorder_siblings` | also required for **writes**: PostgreSQL does not auto-index the referencing side of an FK, so without it every topic DELETE seq-scans `topics` to check for children |
-| 3 | `topics_search_idx GIN (search_vector)` | full-text search | GIN over GiST: ~3× faster to query, slower to write — correct for a read-dominated table |
-| 4 | `topic_redirects_topic_id_idx (topic_id)` | `ON DELETE CASCADE` from topics | same FK story as #2 |
+| 2 | `topics_parent_position_idx (parent_id, position)` | children ordered by sibling position; the authoring trees; `reorder_siblings`; **and the recursive visibility cascade**, which walks the tree by `parent_id` one level at a time | also required for writes: PostgreSQL does not auto-index the referencing side of an FK, so without it every page DELETE seq-scans `topics` |
+| 3 | `topics_owner_idx (owner_id)` | `where owner_id = $1` — now one of the two hottest queries, run on every dashboard load | and for writes: `owner_id` is NOT NULL with no delete action, so `admin_delete_user` must find every page referencing the account. Without this, removing a member is a seq scan |
+| 4 | `topics_search_idx GIN (search_vector)` | full-text search | GIN over GiST: ~3× faster to query, slower to write — correct for a read-dominated table |
+| 5 | `topic_redirects_topic_id_idx (topic_id)` | `ON DELETE CASCADE` from topics | same FK story as #2 |
 
-Index #1's necessity is verifiable — with a seq scan disabled, the planner picks it and
-rewrites the predicate into a byte-range scan:
+Index #1's necessity is verifiable — with seq scan disabled, the planner picks
+it and rewrites the predicate into a byte-range scan:
 
 ```
 Index Only Scan using topics_path_prefix_idx on topics
@@ -569,16 +786,15 @@ Index Only Scan using topics_path_prefix_idx on topics
 
 | Candidate | Why not |
 |---|---|
-| `(status)` | Two values, ~90% one of them. The planner will never choose it; it is pure write overhead |
-| `(created_at)`, `(updated_at)` | The admin dashboard fetches the whole tree (a few thousand narrow rows) and sorts in the browser — under a millisecond |
-| `(slug)` | Never queried alone. Lookups are by full path or by `(parent_id, …)` |
-| `(created_by)` | Scanned only when a profile is deleted — a manual, rare operation |
-| partial `(path) WHERE status='published'` | Would make the nav-tree query an index-only scan. **Add it when the published tree passes ~10,000 rows**; below that, seq scan + sort beats the index maintenance |
+| `(effective_visibility)` | Three values, ~90% one of them. The planner will never choose it; pure write overhead |
+| `(visibility)` | Never queried — every policy and every list reads the *effective* column |
+| `(created_by)`, `(updated_by)` | Both `ON DELETE SET NULL`, so scanned only when an account is deleted. `admin_delete_user()` clears them explicitly in one pass; one extra scan of a few thousand rows costs under a millisecond. `owner_id` is indexed because it is read on every dashboard load; these are not |
+| `(created_at)`, `(updated_at)` | The dashboards fetch a member's whole tree and sort in the browser |
+| `(slug)` | Never queried alone. Lookups go by full path or by `(parent_id, …)` |
+| partial `(path) WHERE effective_visibility <> 'private'` | Would make the public navigation query an index-only scan. **Add it when the shared tree passes ~10,000 pages**; below that, seq scan + sort beats the index maintenance |
 
-Every index is a permanent tax on every write and on backup size. Five is what this query
-set justifies.
-
----
+Every index is a permanent tax on every write and on backup size. Five is what
+this query set justifies.
 
 ## 10. Important SQL queries
 
@@ -619,7 +835,7 @@ body — and none is needed.
 ```sql
 select id, parent_id, title, slug, path, depth, position, excerpt
 from public.topics
-where parent_id = $1 and status = 'published'
+where parent_id = $1 and effective_visibility <> 'private'
 order by position;                     -- topics_parent_position_idx
 ```
 
@@ -641,7 +857,7 @@ order by depth;                        -- topics_path_key, one probe per level
 ```sql
 select id, parent_id, title, slug, path, depth, position
 from public.topics
-where status = 'published'
+where effective_visibility <> 'private'
 order by path;
 ```
 
@@ -689,11 +905,15 @@ select public.descendant_count($1);            -- what the confirm dialog shows
 ### The router
 
 ```jsx
-/login          → LoginPage                      (lazy)
-/admin          → RequireAdmin > AdminLayout     (lazy)
-  index         → AdminTopics
-  topics/new    → AdminEditor
-  topics/:id    → AdminEditor
+/login          → AuthPage mode=login             (lazy)
+/register       → AuthPage mode=register          (lazy)
+/dashboard      → RequireMember > DashboardLayout (lazy)
+  index         → MyPages
+  pages/new     → Editor
+  pages/:id     → Editor
+  all           → RequireMember adminOnly > AllPages
+  people        → RequireMember adminOnly > People
+/admin, /admin/*→ redirect to /dashboard          ← older bookmarks
 /               → DocsLayout
   index         → HomePage
   *             → DocPage      ← the splat: every documentation URL
@@ -705,9 +925,10 @@ table to update, no rebuild, no deploy.**
 
 Route *ranking*, not declaration order, decides the winner: React Router scores static
 segments above dynamic above splats, so `/login` can never be swallowed by `/*`. The
-reserved-slug `CHECK` constraint closes the other half — an author cannot create a
-top-level page at `admin` and shadow the dashboard. **Both halves are needed**; the router
-alone would let a topic at `/admin` become permanently unreachable.
+reserved-slug `CHECK` constraint closes the other half, and it matters far more now
+that *any member* can claim a top-level name: without it someone could create a page at
+`/dashboard` and make the dashboard permanently unreachable for everyone. **Both halves
+are needed.**
 
 | Case | Handling |
 |---|---|
@@ -737,7 +958,7 @@ lists auditable in one place. The nav query selects seven narrow columns and nev
 | `navTree` | 5 min | Sidebar never refetches while browsing |
 | `page` | 5 min | Back button and revisits are instant, 0 requests |
 | `search` | 1 min | `keepPreviousData` — no flicker between keystrokes |
-| `adminTree` | 30 s | Admins expect to see their own writes promptly |
+| `myTopics`, `allTopics`, `users` | 15–30 s | Authors expect to see their own writes promptly |
 
 Invalidation after a write is deliberately **blunt** — every tree and every cached page.
 A rename or move rewrites the `path` of an unknown number of pages, so there is no
@@ -787,57 +1008,74 @@ enormously cheaper than serving a stale URL.
 
 ---
 
-## 13. Admin UI
+## 13. Authoring UI
+
+One dashboard for everyone, with two extra tabs for administrators. The
+alternative — a member area and a separate admin area — would mean two
+implementations of the same page tree, which is how they drift apart.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ [A] Admin                     View site ↗  [☀◐☾]  admin@…   [Sign out]   │
+│ [D] Dashboard   My pages │ All pages │ People    View site ↗  @ada  ADMIN │
 ├──────────────────────────────────────────────────────────────────────────┤
-│  Topics                                             [+ Create topic]     │
-│  16 pages · 15 published · 1 draft                                       │
+│  My pages                                            [ + New page ]      │
+│  4 pages · 3 visible to others · 1 private                               │
 │  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │ Title                    URL                  Updated    Actions   │  │
-│  │ ▾ System Design          /system-design       31 Aug     ↑↓ + ⇄ ● ✕│  │
-│  │   ▾ Rate Limiter         /system-design/rate… 31 Aug     ↑↓ + ⇄ ● ✕│  │
-│  │     Token Bucket         /…/token-bucket      31 Aug     ↑↓ + ⇄ ● ✕│  │
-│  │     Redis        [DRAFT] /…/redis             31 Aug     ↑↓ + ⇄ ◯ ✕│  │
+│  │ Title                  URL              Owner   Updated  Actions   │  │
+│  │ ▾ System Design 👁PUBLIC /system-design  @ada    31 Aug            │  │
+│  │   ▾ Caching     👁PUBLIC /system-design… @ada    31 Aug            │  │
+│  │     Cache Evict ✎SHARED /…/cache-evict… @ada    31 Aug  [▾] ↑↓+⇄✕ │  │
+│  │     Redis       🔒PRIVATE /…/redis        @ada    31 Aug  [▾] ↑↓+⇄✕ │  │
+│  │   Vault         🔒PRIVATE(inherited) …                             │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────────────┘
 
 Editor:
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ ← All topics                              [View ↗] [Publish] [  Save  ]  │
-│ Token Bucket    /system-design/rate-limiter/token-bucket  PUBLISHED      │
-│ ┌── Title ─────────────────────┐ ┌── Slug ────┐ ┌── Parent ───────────┐  │
-│ ┌── Summary (0/320) ──────────────────────────── [Generate from content]│
+│ ← All pages                                       [View ↗] [  Save   ]   │
+│ Token Bucket   /system-design/rate-limiter/token-bucket   👁 PUBLIC       │
+│ ┌ Title ──────────────────┐ ┌ Address ────┐ ┌ Section ────────────────┐  │
+│ ┌ Who can see this? ─────────────────────────────────────────────────┐   │
+│ │ ( ) 🔒 Private      (•) 👁 Anyone can view   ( ) ✎ Anyone can edit │   │
+│ │     Only you…           Everyone reads·you edit  …any member edits │   │
+│ └────────────────────────────────────────────────────────────────────┘   │
+│ ┌ Summary (0/320) ─────────────────────────── [Generate from content]    │
 ├──────────────────────────────────────────────────────────────────────────┤
-│ H2 B I </> {} 🔗 • 1. ❝ ▦          312 words · ~2 min read   [Write|Prev]│
+│ H2 B I </> {} 🔗 • 1. ❝ ▦        312 words · ~2 min read  [Write|Preview] │
 ├─────────────────────────────────┬────────────────────────────────────────┤
 │ # Token Bucket                  │  Token Bucket                          │
-│                                 │  ──────────────                        │
-│ The token bucket algorithm …    │  The token bucket algorithm …          │
 └─────────────────────────────────┴────────────────────────────────────────┘
 ```
 
 Decisions worth defending:
 
-- **The preview uses the *same* `MarkdownRenderer` as the public page** — same plugins,
-  same sanitiser, same components. Two implementations would eventually diverge, and a
-  preview that lies about what readers see is worse than no preview.
-- **Up/down buttons, not drag-and-drop.** Dragging a nested tree well needs a drag library,
-  pointer *and* keyboard equivalents, and "inside vs between" drop-target logic. Two
-  buttons are keyboard-accessible, screen-reader friendly and dependency-free, and each
-  click is one atomic `reorder_siblings()` call. Drag-and-drop can be layered on later over
-  the same RPC.
-- **Slug auto-derives while typing, and stops the moment you touch it.** An existing page's
-  slug is never auto-rewritten from its title — that would silently change a live URL.
-- **Deletion friction scales with consequences.** A leaf is one click. A page with
-  descendants shows the exact count and requires typing the title.
-- **`execCommand('insertText')`** for toolbar insertions, which preserves the browser's
-  native undo stack; assigning `value` directly would destroy it.
-- **Unsaved-changes guard** on tab close, and ⌘S to save.
-
----
+- **Three cards, not a dropdown, for visibility.** It is the setting people get
+  wrong, and the consequence of getting it wrong is either an embarrassing leak
+  or work nobody can find. Each option states who reads and who edits, in that
+  order, in words rather than in the database's vocabulary — nobody thinks "set
+  effective_visibility to collaborative", they think "let anyone edit this".
+- **The inheritance warning is shown, not enforced by disabling.** When the
+  parent is private, this page is private whatever is chosen. Greying the
+  control out leaves people wondering why; leaving it usable and saying *"This
+  page is private regardless, because a section above it is private… the setting
+  you choose takes effect the moment that section is opened up"* explains the
+  model in the one place it matters.
+- **The guest editor is a different form, not a disabled one.** Editing someone
+  else's shared page hides the address, section and visibility fields entirely,
+  and says why. Rendering controls the database would refuse is worse than not
+  rendering them.
+- **The preview uses the *same* `MarkdownRenderer` as the public page** — same
+  plugins, same sanitiser, same components. Two implementations would eventually
+  diverge, and a preview that lies about what readers see is worse than none.
+- **Up/down buttons, not drag-and-drop.** Dragging a nested tree well needs a
+  drag library, pointer *and* keyboard equivalents, and "inside vs between"
+  drop-target logic. Two buttons are keyboard-accessible, screen-reader
+  friendly, dependency-free, and each click is one atomic `reorder_siblings()`.
+- **Deletion friction scales with consequences.** A leaf is one click. A section
+  with descendants shows the exact count and requires typing the title.
+- **Suspension is offered before deletion on the People page**, and the delete
+  dialog says so again. The usual problem is "this person must stop changing
+  things", not "this person must cease to exist".
 
 ## 14. Markdown rendering strategy
 
@@ -893,28 +1131,40 @@ features confirmed still working (§23).
 
 | Threat | Control | Verified |
 |---|---|---|
-| Anonymous reads a draft | RLS `status='published'`; `get_page` is `SECURITY INVOKER` | ✓ 404 in browser |
+| Anonymous reads a private page | RLS `effective_visibility <> 'private'`; `get_page` is `SECURITY INVOKER` | ✓ 404 in browser |
+| Anonymous reads a public page inside a private section | `effective_visibility` is materialised from the ancestor chain | ✓ hidden, then revealed when the parent opens |
 | Anonymous writes | `anon` granted `SELECT` only — fails before RLS | ✓ `permission denied` |
-| Viewer writes | RLS `is_admin()`; policies OR'ed, no admin policy matches | ✓ 0 rows / RLS violation |
-| Privilege escalation | No write policy on `profiles`; no grant; guard trigger | ✓ `permission denied` |
-| `SECURITY DEFINER` hijack | `set search_path = ''` on every such function | ✓ by construction |
-| RLS recursion (`42P17`) | `is_admin()` is `SECURITY DEFINER`, bypassing `profiles` RLS | ✓ policies apply cleanly |
+| Member reads someone else's private page | No policy matches | ✓ row invisible |
+| Member writes into someone else's section | INSERT policy calls `can_edit(parent_id)` | ✓ RLS violation |
+| **Collaborator seizes ownership** | `topics_before_write()` compares against OLD and refuses | ✓ explicit refusal |
+| **Collaborator flips a shared page to private** | same guard | ✓ explicit refusal |
+| **Collaborator renames or moves a shared page** | same guard | ✓ explicit refusal |
+| Collaborator deletes a shared page | No collaborative DELETE policy exists | ✓ 0 rows / error |
+| Suspended member writes | `is_active()` in every write policy | ✓ RLS violation; content untouched |
+| Suspended administrator uses admin powers | `is_admin()` requires `status='active'` | ✓ by construction |
+| Member promotes themself | No writable `role`; `profiles_guard()`; `admin_set_role` checks `is_admin()` | ✓ three refusals |
+| Member changes their own status or email | `profiles_guard()` | ✓ distinct messages |
+| Member reads others' emails | `profiles` SELECT is own-row only; world gets a 3-column view | ✓ 1 row visible |
+| Admin removes the last administrator | `assert_admin_target()` | ✓ refused |
+| Admin locks themselves out | Self-guard on role, status and delete | ✓ refused; UI also disables |
+| Deleting a member destroys documentation | `admin_delete_user()` transfers pages first | ✓ pages survive, timestamps unchanged |
+| `SECURITY DEFINER` hijack | `set search_path = ''` on all of them | ✓ 8/8 pinned |
+| RLS recursion (`42P17`) | Helpers are `SECURITY DEFINER`, bypassing profiles' RLS | ✓ policies apply cleanly |
+| Route shadowing (`/dashboard`, `/register`) | Reserved root slugs `CHECK` — now that any member can claim a top-level name | ✓ constraint violation |
 | XSS via Markdown | No raw HTML + `urlTransform` + `rehype-sanitize` last | ✓ 18/18 blocked |
 | XSS via search snippet | `ts_headline` returns `<<…>>` sentinels; React builds `<mark>` | ✓ no `innerHTML` in path |
 | DOM clobbering | `clobberPrefix: 'user-content-'` retained | ✓ ids prefixed |
 | SQL injection | PostgREST parameterises everything; RPC args are typed and bound | ✓ by construction |
-| Forged `path` / `created_by` | Trigger overwrites both regardless of payload | ✓ |
-| Slug manipulation | `CHECK` regex + `slugify()` normalisation + reserved-word `CHECK` | ✓ |
-| Route shadowing | Reserved root slugs cannot be created | ✓ constraint violation |
+| Forged `owner_id` / `path` / `created_by` | Trigger overwrites all three regardless of payload | ✓ |
+| Private page indexed by search engines | `noindex` on private pages; sitemap filters on `effective_visibility` | ✓ |
+| Redirect confirms a private page exists | Redirect policy requires the target to be visible | ✓ invisible, not 404 |
 | Accidental subtree wipe | FK `NO ACTION` + typed confirmation | ✓ FK error, dialog gated |
-| Reverse tabnabbing | `rel="noopener noreferrer"` on external links | ✓ |
-| Clickjacking | `X-Frame-Options: DENY` + CSP `frame-ancestors 'none'` | ✓ headers set |
-| Service-role leak | Never referenced in any `VITE_` variable; documented in `.env.example` | ✓ absent from bundle |
+| Service-role leak | Never referenced in any `VITE_` variable | ✓ absent from bundle |
 
 ### Cascading deletion — the design
 
-This is the requirement most easily got wrong in both directions, and the fix is one word
-in the schema.
+The requirement most easily got wrong in both directions, fixed by one word in
+the schema.
 
 | FK action | Delete a parent alone | Delete a subtree in one statement |
 |---|---|---|
@@ -922,29 +1172,16 @@ in the schema.
 | `RESTRICT` | errors ✓ | **also errors** ✗ — checked immediately, not deferrable |
 | **`NO ACTION`** (chosen) | **errors ✓** | **works ✓** — checked at *end of statement* |
 
-`NO ACTION` gives exactly the requested semantics for free. `delete_topic(id, cascade)`
-then reads:
-
-```sql
-if p_cascade then
-  delete from public.topics where path = v_path or path like v_path || '/%';  -- one statement
-else
-  delete from public.topics where id = p_id;                                   -- FK guards it
-end if;
-```
-
-A stray delete of a section cannot destroy it. A deliberate one succeeds and returns the
-count, so the UI says "deleted 4 pages" instead of leaving the author guessing.
-
 ### The anon key is public, and that is fine
 
-Vite inlines every `VITE_*` variable into the bundle. The anon key **grants nothing** — it
-identifies the request as the `anon` Postgres role. Every permission decision happens
-afterwards, in RLS. The service-role key is a different matter entirely: it bypasses RLS
-completely, and this application has no server-side context in which it could legitimately
-appear. It is absent from the codebase and called out in `.env.example`.
-
----
+Vite inlines every `VITE_*` variable into the bundle. The anon key **grants
+nothing** — it identifies the request as the `anon` Postgres role, and every
+permission decision happens afterwards in RLS. The service-role key is a
+different matter: it bypasses RLS completely, and on a multi-user site that
+means publishing every member's private pages. This application has no
+server-side context in which it could legitimately appear; it is absent from the
+codebase and called out in `.env.example` and in the sitemap script, which
+deliberately uses the anon key precisely so it cannot leak private paths.
 
 ## 16. Performance analysis
 
@@ -985,10 +1222,11 @@ that a correctly configured client cache does the job for free.
 | `index` (app) | 22.9 KB | always |
 | `markdown` | 108.0 KB | on any documentation page |
 | CSS | 10.6 KB | always |
-| `AdminTopics` + `AdminEditor` + `AdminLayout` + `Modal` + `LoginPage` | **9.8 KB** | **only after signing in** |
+| `Editor` + `PageManager` + `People` + `DashboardLayout` + `AuthPage` + `Modal` + `MyPages` + `AllPages` | **15.8 KB** | **only when authoring** |
 
-Code-splitting the admin surface cut the shared application chunk from 29.1 KB to 22.9 KB
-gzipped — a reader never downloads the editor, the dialogs or the admin tree.
+Code-splitting the authoring surface keeps the shared application chunk at 25.4 KB
+gzipped — a reader never downloads the editor, the dialogs, the tree manager or the
+people table, even though the site now has accounts.
 
 ### Query costs
 
@@ -1131,20 +1369,23 @@ project/
 │   │   ├── docs/        Sidebar · Breadcrumbs · PrevNext · TableOfContents · SearchDialog
 │   │   ├── admin/       TopicTree · MarkdownEditor · MoveDialog · DeleteDialog
 │   │   └── ui/          Spinner · ErrorState · ThemeToggle · Modal · Seo
-│   ├── layouts/         DocsLayout.jsx · AdminLayout.jsx (+ RequireAdmin)
-│   ├── pages/           HomePage · DocPage · LoginPage · RouteError · admin/*
+│   ├── layouts/         DocsLayout.jsx · DashboardLayout.jsx (+ RequireMember)
+│   ├── pages/           HomePage · DocPage · AuthPage · RouteError
+│   │                    dashboard/ MyPages · AllPages · People · Editor · PageManager
 │   ├── routes/          index.jsx                     ← the whole route table
 │   ├── hooks/           useAuth · useTheme · useTopics · useDebounced
-│   ├── services/        topics.js                     ← the ONLY module that queries
+│   ├── services/        topics.js · admin.js          ← the ONLY modules that query
 │   ├── lib/             supabase.js · config.js · errors.js · queryClient.js
 │   ├── utils/           slug.js · tree.js · markdown.js
 │   ├── App.jsx · main.jsx · index.css
 ├── supabase/
-│   ├── migrations/      schema → functions → rls → indexes
+│   ├── migrations/      schema → functions → admin → rls → indexes
+│   ├── schema.sql       all five, concatenated for one-shot pasting
 │   └── seed.sql
 ├── scripts/             generate-sitemap.mjs
-├── tests/               db.test.sql · xss.test.jsx · public.e2e.mjs · admin.e2e.mjs
-│                        + local harness (fake Supabase for offline testing)
+├── tests/               db.*.test.sql · xss.test.jsx
+│                        public / authoring / multiuser .e2e.mjs
+│                        + local harness and a PostgREST stand-in
 ├── public/              favicon.svg
 ├── .env.example · vercel.json · vite.config.js · index.html · package.json
 └── README.md · ARCHITECTURE.md
@@ -1167,8 +1408,9 @@ shell it guards rather than in a separate `guards/` folder.
 | 5 · Markdown | Editor + toolbar, live preview, GFM, highlighting, sanitisation | ✅ |
 | 6 · Public docs | Splat routing, sidebar, breadcrumbs, TOC, prev/next, search, responsive | ✅ |
 | 7 · Perf & SEO | Code splitting, cache policy, metadata, JSON-LD, sitemap, headers | ✅ |
-| 8 · Testing | 29 SQL behaviour checks · 30 XSS/feature checks · 56 browser checks | ✅ |
-| 9 · Deployment | `vercel.json`, env docs, migration + domain runbook | ✅ (documented) |
+| 8 · Multi-user | Registration, per-page visibility with inheritance, collaborative editing, suspension, account management | ✅ |
+| 9 · Testing | 74 SQL checks · 30 XSS/feature checks · 95 browser checks | ✅ |
+| 10 · Deployment | `vercel.json`, env docs, migration + domain runbook | ✅ (documented) |
 
 ---
 
@@ -1176,40 +1418,48 @@ shell it guards rather than in a separate `guards/` folder.
 
 | # | Case | Handling |
 |---|---|---|
-| 1 | Two siblings, same title | Auto-slug numbers the second: `caching-2` |
-| 2 | Two siblings, same slug typed explicitly | `23505` on `topics_path_key` → "Another page already uses that URL" |
-| 3 | Two **root** topics, same slug | Caught — `UNIQUE (path)` has no NULL-distinctness hole |
-| 4 | Move a node into its own descendant | Trigger raises `23514`; the UI also greys out the option |
-| 5 | Move a node into itself | Same guard + `CHECK (parent_id <> id)` |
+| 1 | Two siblings, same title | Auto-slug numbers the second: `notes-2` |
+| 2 | Two siblings, same slug typed explicitly | `23505` → "Another page already uses that URL" |
+| 3 | Two **root** pages, same slug | Caught — `UNIQUE (path)` has no NULL-distinctness hole |
+| 4 | A member claims `/dashboard` at the root | Reserved-slug `CHECK` refuses; nested `dashboard` is fine |
+| 5 | Move a page into its own descendant | Trigger raises `23514`; the UI also greys out the option |
 | 6 | Move that would push descendants past depth 8 | Pre-checked against `max(depth)` of the subtree |
-| 7 | Title with accents/punctuation | `unaccent` + regex: `Cache Éviction: LRU / LFU!` → `cache-eviction-lru-lfu` |
-| 8 | Title with no URL-safe characters (e.g. `"…"`) | Explicit error rather than an empty slug |
-| 9 | Root topic slugged `admin` | `CHECK` rejects; nested `admin` is fine |
-| 10 | Rename a mid-tree node | Descendants rewritten in one statement; redirects for all |
-| 11 | Move a 2-level subtree | Grandchildren correct — the cascade-flag fix (§5) |
-| 12 | Old URL after 3 renames | One hop: redirects store a topic **id**, so no chains |
-| 13 | New page claims a previously-redirected path | Insert trigger clears the stale redirect |
-| 14 | Redirect points at a page that became a draft | RLS filters the join → 404, not a leak |
-| 15 | Delete a page with children, no cascade | FK `NO ACTION` errors at statement end; nothing lost |
-| 16 | Delete a subtree deliberately | One statement, `NO ACTION` permits it, count returned |
-| 17 | Published child of an unpublished parent | Promoted to a sidebar root rather than hidden |
-| 18 | Draft requested anonymously | `get_page` returns `{topic: null}` → 404 |
-| 19 | Draft found via search | RLS filters `search_topics` too |
-| 20 | Empty content | Renderer shows "This page has no content yet" |
-| 21 | Malformed Markdown | remark never throws; renders as literal text |
-| 22 | Very wide table / long code line | Scrolls inside its own box; page never scrolls horizontally |
-| 23 | Anchor link `[x](#heading)` | Rewritten with the `user-content-` clobber prefix |
-| 24 | Duplicate headings in one page | github-slugger suffixes `-1`, `-2`; TOC matches |
-| 25 | Session expires mid-edit | `PGRST301` → "Your session expired. Please sign in again." |
-| 26 | Supabase project paused / offline | `Failed to fetch` → network error state with retry |
-| 27 | Migrations not applied | `42P01` → "Have the migrations been applied?" |
-| 28 | Missing `.env` | Caught at boot; instructions rendered instead of a white screen |
-| 29 | Non-admin signs in | "Signed in, but not an administrator" — not a bare 403 |
-| 30 | Tab closed with unsaved Markdown | `beforeunload` guard |
-| 31 | `localStorage` blocked (private mode) | Theme falls back to system; wrapped in try/catch |
-| 32 | Hard refresh on a deep URL | Vercel SPA rewrite → `index.html` |
-
----
+| 7 | Rename a mid-tree page | Descendants rewritten in one statement; redirects for all |
+| 8 | Move a 2-level subtree | Grandchildren correct — the cascade-flag fix (§5) |
+| 9 | Old URL after three renames | One hop: redirects store a page **id**, so no chains |
+| 10 | New page claims a previously-redirected path | Insert trigger clears the stale redirect |
+| 11 | Redirect points at a page you may not see | Redirect policy hides the row entirely — not a 404 that confirms it exists |
+| 12 | **Public page inside a private section** | `effective_visibility` = private; hidden from everyone but the owner |
+| 13 | **Private section is opened up** | Descendants revert to their own settings; an independently-private child stays private |
+| 14 | **Collaborative page inside a private section** | Effectively private — nobody can edit what nobody can see |
+| 15 | **Collaborative page under a merely public parent** | Stays collaborative; only `private` propagates |
+| 16 | Guest edits a shared page and resends unchanged metadata | Passes — the guard compares against OLD, not a blanket column ban |
+| 17 | Guest attempts a rename, move, or visibility change | Refused with one readable sentence |
+| 18 | Owner deletes a subtree containing someone else's page | FK blocks it; the contributor's work is not silently destroyed |
+| 19 | Suspended member's pages | Stay published, stay owned, stay exactly as they were |
+| 20 | Suspended member opens the dashboard | Let in, shown a banner; every write control is inert |
+| 21 | Suspended administrator | `is_admin()` returns false — no admin powers |
+| 22 | Last administrator demotes, suspends or deletes themselves | `assert_admin_target()` refuses all three |
+| 23 | Deleting a member | Pages transfer to the acting admin; `created_by` cleared; timestamps untouched |
+| 24 | Two accounts with the same email local part | Usernames de-duplicated: `alice`, `alice2` |
+| 25 | Signup with a 1-character local part (`j@…`) | Padded to `j00` rather than failing the CHECK |
+| 26 | Registering an email that already exists | Detected via GoTrue's empty `identities` array → "An account already exists" |
+| 27 | Email confirmation is switched on | `signUp` returns no session → "Check your email" screen |
+| 28 | Page saved with no Markdown heading | The stored title renders as `<h1>` so the page is never untitled |
+| 29 | Title with accents/punctuation | `unaccent` + regex: `Cache Éviction: LRU!` → `cache-eviction-lru` |
+| 30 | Title with no URL-safe characters | Explicit error rather than an empty slug |
+| 31 | Empty content | Renderer shows "This page has no content yet" |
+| 32 | Malformed Markdown | remark never throws; renders as literal text |
+| 33 | Very wide table / long code line | Scrolls inside its own box; the page never scrolls sideways |
+| 34 | Anchor link `[x](#heading)` | Rewritten with the `user-content-` clobber prefix |
+| 35 | Duplicate headings in one page | github-slugger suffixes `-1`, `-2`; the TOC matches |
+| 36 | Session expires mid-edit | `PGRST301` → "Your session expired. Please sign in again." |
+| 37 | Supabase project paused / offline | `Failed to fetch` → network error state with retry |
+| 38 | Migrations not applied | `42P01` → "Have the migrations been applied?" |
+| 39 | Missing `.env` | Caught at boot; instructions rendered instead of a white screen |
+| 40 | Tab closed with unsaved Markdown | `beforeunload` guard |
+| 41 | `localStorage` blocked (private mode) | Theme falls back to system; wrapped in try/catch |
+| 42 | Hard refresh on a deep URL | Vercel SPA rewrite → `index.html` |
 
 ## 22. Future scalability
 
@@ -1240,7 +1490,7 @@ hot read path exactly as it is.
 
 | Trigger | Change |
 |---|---|
-| Nav tree > ~10k published pages | Add partial index `(path) WHERE status='published'`; consider lazy sidebar branches |
+| Nav tree > ~10k shared pages | Add partial index `(path) WHERE effective_visibility <> 'private'`; consider lazy sidebar branches |
 | Search feels imprecise | Add trigram fuzzy matching (`pg_trgm`) before reaching for an external engine |
 | Corpus > ~100k documents | Postgres FTS is still fine; beyond that, Typesense/Meilisearch for typo tolerance and faceting |
 | Social previews / first paint matter | Migrate to Next.js — data layer moves unchanged (§17) |
@@ -1265,27 +1515,45 @@ hot read path exactly as it is.
 
 ## 23. Verification
 
-Nothing above is asserted from reading the code. The database ran on PostgreSQL 16.13 with
-an `en_US.UTF-8` collation (matching Supabase) behind a minimal `auth` schema shim; the UI
-ran in headless Chromium against that database.
+Nothing above is asserted from reading the code. The database ran on PostgreSQL
+16.13 with an `en_US.UTF-8` collation (matching Supabase) behind a minimal
+`auth` schema shim; the UI ran in headless Chromium against that database,
+through a ~200-line PostgREST/GoTrue stand-in that runs every request as the
+real `anon` or `authenticated` role — so the browser suites exercise the actual
+RLS policies rather than mocks.
 
 | Suite | Checks | Result |
 |---|---|---|
-| SQL behaviour — paths, plans, rename/move cascade, cycle guards, slug rules, depth ceiling, delete semantics, reorder, search, RLS for anon/viewer/admin, privilege escalation | 29 | **all pass** |
+| SQL — paths, plans, rename/move cascade, cycle guards, slug rules, depth ceiling, delete semantics, reorder, search | 29 | **all pass** |
+| SQL — the permission model: registration and username de-duplication, the read matrix for four actors, private inheritance both directions, creation rights, the collaborative takeover attempt, owner rights, suspension, admin guards, account deletion with page transfer, escalation through `profiles`, `public_profiles` exposure, `can_edit` agreement | 45 | **all pass** |
 | Markdown security — 18 XSS payloads + 12 feature checks | 30 | **18/18 blocked, 12/12 working** |
-| Public UI — routing, metadata, breadcrumbs, GFM, highlighting, TOC anchors, prev/next, search + highlight, dark mode, RLS-backed 404s, mobile layout, request count | 36 | **all pass** |
-| Admin UI — sign-in, tree, auto-slug, live preview, DB-materialised path, publish→live URL, rename→redirect, move→redirect, delete blast radius + confirmation gate, reorder | 20 | **all pass** |
+| Browser — public site: routing, metadata, breadcrumbs, GFM, highlighting, TOC anchors, prev/next, search, dark mode, RLS-backed 404s, mobile layout, request count | 36 | **all pass** |
+| Browser — authoring: the full tree, auto-slug, live preview, DB-materialised path, publish→live URL, rename→redirect, move→redirect, delete blast radius, visibility from the tree, reorder | 22 | **all pass** |
+| Browser — multi-user: registration, private-by-default, publishing, collaborative editing, the guest form, private inheritance through the UI, the People page, self-action guards, suspension, admin route guards, account deletion with transfer | 37 | **all pass** |
 
-Three real defects were found and fixed by these tests, not by inspection:
+Six real defects were found and fixed by these tests, not by inspection:
 
-1. **Duplicate `<title>` and `<meta description>`** — React 19 prepends hoisted tags rather
-   than replacing the static ones in `index.html`. Fixed with `data-default` markers that
-   `<Seo>` removes on mount.
-2. **Heading anchors silently broken** — `rehype-sanitize` prefixes ids with
-   `user-content-`, so every TOC and in-document anchor link pointed at nothing. Fixed by
-   applying the same prefix on both sides.
-3. **Syntax highlighting silently stripped** — sanitising after `rehype-highlight` removes
-   `className` from `<span>` unless the schema allows it. Fixed with a narrow
-   `/^hljs-/` allowance.
+1. **Deleting a user failed with a foreign-key violation.** The "created_by is
+   never rewritten" guard in `topics_before_write()` was undoing PostgreSQL's
+   own `ON DELETE SET NULL`, so the delete then failed on the very constraint
+   that action exists to satisfy. The guard now rejects a change to a *different*
+   author and lets NULL through.
+2. **`can_edit` never reached the page.** `get_page()` returned it, and the
+   service layer mapped exactly three fields out of the response and silently
+   dropped it — so "Edit this page" never appeared on a shared page.
+3. **Duplicate `<title>` and `<meta description>`.** React 19 prepends hoisted
+   tags rather than replacing the static ones in `index.html`.
+4. **Heading anchors silently broken.** `rehype-sanitize` prefixes ids with
+   `user-content-`, so every TOC and in-document anchor pointed at nothing.
+5. **Syntax highlighting silently stripped.** Sanitising after
+   `rehype-highlight` removes `className` from `<span>` unless the schema allows
+   it.
+6. **A page with no Markdown heading rendered with no title at all**, leaving
+   the breadcrumb as the only clue what you were reading.
 
-All three are the kind that look fine in code review and fail in production.
+All six look fine in code review.
+
+One deliberate change came out of testing rather than a bug: the collaborative
+guard originally reverted a guest's forbidden fields silently and reported
+success. It now refuses with a sentence explaining what a guest may and may not
+change — a no-op that says "saved" is worse than an error.

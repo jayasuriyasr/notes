@@ -1,18 +1,19 @@
 import { createContext, useContext, useEffect, useMemo, useState, useCallback } from 'react';
 import { supabase } from '../lib/supabase';
-import { normalizeError } from '../lib/errors';
+import { normalizeError, AppError, ERROR_KIND } from '../lib/errors';
 
 const AuthContext = createContext(null);
 
 /**
  * Session + profile state.
  *
- * IMPORTANT: `isAdmin` here decides what the UI *renders*. It decides
- * nothing about what the database *permits*. A user who flips this flag
- * in React DevTools sees the admin dashboard render and then watches
- * every request it makes come back empty, because RLS evaluates
- * public.is_admin() server-side against their JWT. The frontend check
- * exists so that non-admins are not shown buttons that cannot work.
+ * WHAT THESE FLAGS ARE FOR
+ * `isAdmin` and `canWrite` decide what the UI *renders*. They decide
+ * nothing about what the database *permits*. A user who flips either one
+ * in DevTools sees more buttons appear and then watches every request
+ * they make come back empty or refused, because RLS evaluates
+ * public.is_admin() and public.is_active() server-side against their JWT.
+ * The flags exist so that people are not shown controls that cannot work.
  */
 export function AuthProvider({ children }) {
   const [session, setSession] = useState(null);
@@ -26,7 +27,7 @@ export function AuthProvider({ children }) {
       if (!userId) return null;
       const { data, error } = await supabase
         .from('profiles')
-        .select('id,email,display_name,role')
+        .select('id,email,username,display_name,role,status')
         .eq('id', userId)
         .limit(1);
       if (error) return null;
@@ -59,23 +60,63 @@ export function AuthProvider({ children }) {
     return data;
   }, []);
 
+  /**
+   * Registration.
+   *
+   * Note what is NOT sent: a role. The signup trigger writes
+   * ('member','active') unconditionally and never reads the payload, so
+   * posting {"role":"admin"} to this endpoint achieves precisely nothing.
+   *
+   * Returns { needsConfirmation } so the caller can tell the two normal
+   * outcomes apart: with email confirmation switched on, Supabase returns
+   * a user but no session, and the person must click a link before they
+   * can sign in. Silently doing nothing in that case is the single most
+   * confusing thing a signup form can do.
+   */
+  const signUp = useCallback(async (email, password, displayName) => {
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: { data: displayName ? { display_name: displayName } : {} },
+    });
+    if (error) throw normalizeError(error);
+
+    // Supabase returns an existing-but-unconfirmed user with an empty
+    // identities array rather than an error, to avoid leaking which
+    // addresses are registered.
+    if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+      throw new AppError(
+        ERROR_KIND.CONFLICT,
+        'An account already exists for that email address. Try signing in, or reset your password.',
+      );
+    }
+
+    return { needsConfirmation: !data.session, user: data.user };
+  }, []);
+
   const signOut = useCallback(async () => {
     const { error } = await supabase.auth.signOut();
     if (error) throw normalizeError(error);
   }, []);
 
-  const value = useMemo(
-    () => ({
+  const value = useMemo(() => {
+    const isAdmin = profile?.role === 'admin' && profile?.status === 'active';
+    return {
       session,
       user: session?.user ?? null,
       profile,
-      isAdmin: profile?.role === 'admin',
       loading,
+      isAdmin,
+      // A suspended account keeps its pages and can still read the site.
+      // It simply stops being able to change anything — which is exactly
+      // what is_active() enforces in every write policy.
+      isSuspended: profile?.status === 'suspended',
+      canWrite: Boolean(profile) && profile.status === 'active',
       signIn,
+      signUp,
       signOut,
-    }),
-    [session, profile, loading, signIn, signOut],
-  );
+    };
+  }, [session, profile, loading, signIn, signUp, signOut]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

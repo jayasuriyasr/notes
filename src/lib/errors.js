@@ -30,6 +30,12 @@ export class AppError extends Error {
 const CONSTRAINT_MESSAGES = {
   topics_path_key:
     'Another page already uses that URL. Pick a different slug, or move this page under a different parent.',
+  topics_visibility_check: 'Visibility must be private, public or collaborative.',
+  topics_effective_visibility_check: 'Visibility must be private, public or collaborative.',
+  profiles_username_key: 'That username is already taken.',
+  profiles_username_format:
+    'Usernames are 3-30 characters: lowercase letters, numbers, hyphens and underscores.',
+  profiles_status_check: 'Unknown account status.',
   topics_slug_format:
     'Slugs may contain lowercase letters, numbers and single hyphens only — for example "rate-limiter".',
   topics_reserved_root_slug:
@@ -81,8 +87,15 @@ export function normalizeError(error) {
       const hit = Object.keys(CONSTRAINT_MESSAGES).find((name) => raw.includes(name));
       return new AppError(ERROR_KIND.VALIDATION, hit ? CONSTRAINT_MESSAGES[hit] : raw, { cause: error });
     }
-    case '42501': // insufficient_privilege
-      return new AppError(ERROR_KIND.FORBIDDEN, 'You do not have permission to do that.', { cause: error });
+    case '42501':
+      // insufficient_privilege. Almost every one of these is raised by our
+      // own guards - the collaborative-edit freeze, the admin_* checks,
+      // the last-administrator rule - and each already carries a sentence
+      // written for a person. Passing it through beats replacing it with
+      // a generic "permission denied" that explains nothing.
+      return new AppError(ERROR_KIND.FORBIDDEN, raw || 'You do not have permission to do that.', {
+        cause: error,
+      });
     case 'P0002':
       return new AppError(ERROR_KIND.NOT_FOUND, 'That page no longer exists.', { cause: error });
 
@@ -103,13 +116,38 @@ export function normalizeError(error) {
       break;
   }
 
-  // RLS rejection on INSERT/UPDATE arrives as this rather than a code.
+  // An RLS rejection on INSERT/UPDATE arrives as a message, not a code.
+  // It is the database's way of saying "no policy matched", which for
+  // this application is nearly always one of three situations.
   if (/row-level security/i.test(raw)) {
     return new AppError(
       ERROR_KIND.FORBIDDEN,
-      'You do not have permission to change this content. Administrator access is required.',
+      'You do not have permission to save that. You can add pages to your own sections and to any ' +
+        'section marked "anyone can edit" — and a suspended account cannot make changes at all.',
       { cause: error },
     );
+  }
+
+  // Supabase Auth surfaces these as plain messages.
+  if (/already registered|already been registered/i.test(raw)) {
+    return new AppError(ERROR_KIND.CONFLICT, 'An account already exists for that email address.', {
+      cause: error,
+    });
+  }
+  if (/invalid login credentials/i.test(raw)) {
+    return new AppError(ERROR_KIND.UNAUTHENTICATED, 'That email and password do not match an account.', {
+      cause: error,
+    });
+  }
+  if (/password should be at least/i.test(raw)) {
+    return new AppError(ERROR_KIND.VALIDATION, 'Choose a password of at least 6 characters.', {
+      cause: error,
+    });
+  }
+  if (/email rate limit|too many requests/i.test(raw)) {
+    return new AppError(ERROR_KIND.SERVER, 'Too many attempts. Wait a minute and try again.', {
+      cause: error,
+    });
   }
 
   if (error.status === 401) {

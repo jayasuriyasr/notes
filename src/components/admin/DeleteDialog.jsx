@@ -5,7 +5,7 @@ import { ErrorState } from '../ui/ErrorState';
 import { Spinner } from '../ui/Spinner';
 
 /**
- * Deletion, with the blast radius stated before the button is armed (§13).
+ * Deletion, with the blast radius stated before the button is armed.
  *
  * Two layers stop an accidental subtree wipe:
  *   - The FK on topics.parent_id is NO ACTION, so a plain delete of a page
@@ -76,8 +76,8 @@ export function DeleteDialog({ open, node, onClose, onConfirm, isPending, error 
           />
 
           <p className="mt-3 text-xs text-zinc-500">
-            Considering unpublishing instead? An unpublished page disappears from the public site but keeps
-            its content and its URL.
+            Considering making it private instead? A private page disappears from the site for everyone else
+            but keeps its content, its address and everything nested inside it.
           </p>
         </>
       ) : (

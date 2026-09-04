@@ -1,6 +1,7 @@
 import { useEffect, useMemo } from 'react';
 import { useParams, useNavigate, useOutletContext, Link } from 'react-router-dom';
 import { usePage, useRedirect } from '../hooks/useTopics';
+import { VisibilityBadge } from '../components/admin/VisibilityPicker';
 import { MarkdownRenderer } from '../components/markdown/MarkdownRenderer';
 import Breadcrumbs from '../components/docs/Breadcrumbs';
 import PrevNext from '../components/docs/PrevNext';
@@ -9,7 +10,7 @@ import { ArticleSkeleton } from '../components/ui/Spinner';
 import { ErrorState } from '../components/ui/ErrorState';
 import { Seo } from '../components/ui/Seo';
 import { getPrevNext } from '../utils/tree';
-import { extractHeadings, deriveExcerpt } from '../utils/markdown';
+import { extractHeadings, deriveExcerpt, startsWithH1 } from '../utils/markdown';
 import { normalizePath } from '../utils/slug';
 import { SITE_URL } from '../lib/config';
 
@@ -93,15 +94,52 @@ export function DocPage() {
     );
   }
 
+  const isPrivate = topic.effective_visibility === 'private';
+
   return (
     <>
-      <Seo title={topic.title} description={description} path={topic.path} />
+      {/* A page only the owner can see must never be indexed, and its
+          canonical URL must not advertise it either. */}
+      <Seo
+        title={topic.title}
+        description={description}
+        path={topic.path}
+        noindex={isPrivate}
+      />
 
       <div className="flex gap-10 py-10 lg:py-14">
         <article className="min-w-0 flex-1">
           <Breadcrumbs items={data.breadcrumbs} siteUrl={SITE_URL} />
 
+          {/* Shown only to people who can act on it: the owner, an
+              administrator, or anyone on a page open to all members. */}
+          {(data.canEdit || isPrivate) && (
+            <div className="mb-6 flex flex-wrap items-center gap-3 rounded-lg border border-zinc-200
+                            bg-zinc-50 px-3 py-2 text-sm dark:border-zinc-800 dark:bg-zinc-900/60">
+              <VisibilityBadge value={topic.effective_visibility} />
+              <span className="text-zinc-500">
+                {isPrivate
+                  ? 'Only you and administrators can see this page.'
+                  : topic.effective_visibility === 'collaborative'
+                    ? 'Any signed-in member can edit this page.'
+                    : 'Published for everyone.'}
+              </span>
+              <span className="flex-1" />
+              {data.canEdit && (
+                <Link
+                  to={`/dashboard/pages/${topic.id}`}
+                  className="font-medium text-brand-600 hover:underline dark:text-brand-400"
+                >
+                  Edit this page →
+                </Link>
+              )}
+            </div>
+          )}
+
           <div className="doc-prose">
+            {/* Only when the document does not already open with one, so a
+                normal page never shows its title twice. */}
+            {!startsWithH1(topic.content) && <h1>{topic.title}</h1>}
             <MarkdownRenderer content={topic.content} />
           </div>
 
@@ -126,6 +164,9 @@ export function DocPage() {
                     {child.excerpt && (
                       <p className="mt-1 line-clamp-2 text-sm text-zinc-500 dark:text-zinc-400">{child.excerpt}</p>
                     )}
+                    {child.visibility === 'private' && (
+                      <VisibilityBadge value="private" className="mt-2" />
+                    )}
                   </Link>
                 ))}
               </div>
@@ -135,7 +176,16 @@ export function DocPage() {
           <PrevNext prev={prev} next={next} />
 
           <p className="mt-10 text-xs text-zinc-400">
-            Last updated{' '}
+            {topic.owner_username && (
+              <>Written by <span className="text-zinc-500 dark:text-zinc-400">
+                {topic.owner_name || `@${topic.owner_username}`}
+              </span>{' · '}</>
+            )}
+            {topic.editor_username && topic.editor_username !== topic.owner_username && (
+              <>last edited by <span className="text-zinc-500 dark:text-zinc-400">
+                @{topic.editor_username}
+              </span>{' · '}</>
+            )}
             <time dateTime={topic.updated_at}>
               {new Date(topic.updated_at).toLocaleDateString(undefined, {
                 year: 'numeric', month: 'long', day: 'numeric',

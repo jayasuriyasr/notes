@@ -46,11 +46,13 @@ async function fetchPublishedPaths() {
   if (!SUPABASE_URL || !ANON_KEY) return null;
 
   // The anon key is all that is needed: RLS already restricts this to
-  // published rows, which is exactly what belongs in a sitemap. There is
-  // no reason for a build script to hold the service-role key.
+  // pages an anonymous visitor can read, which is exactly what belongs
+  // in a sitemap. There is no reason for a build script to hold the
+  // service-role key — and with a multi-user site, holding it would mean
+  // publishing every member's private pages to Google.
   const url =
     `${SUPABASE_URL}/rest/v1/topics` +
-    `?select=path,updated_at&status=eq.published&order=path.asc`;
+    `?select=path,updated_at&effective_visibility=neq.private&order=path.asc`;
 
   const res = await fetch(url, {
     headers: { apikey: ANON_KEY, Authorization: `Bearer ${ANON_KEY}` },
@@ -91,11 +93,12 @@ const robotsTxt = () =>
   [
     'User-agent: *',
     'Allow: /',
-    // Nothing secret lives here — RLS makes an unauthenticated /admin
-    // request useless — but there is no reason to spend crawl budget on
-    // a route that renders a sign-in prompt.
-    'Disallow: /admin',
+    // Nothing secret lives here — RLS makes an unauthenticated request
+    // to any of these useless — but there is no reason to spend crawl
+    // budget on routes that render a sign-in prompt.
+    'Disallow: /dashboard',
     'Disallow: /login',
+    'Disallow: /register',
     '',
     SITE_URL ? `Sitemap: ${SITE_URL}/sitemap.xml` : '',
     '',

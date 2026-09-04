@@ -1,19 +1,44 @@
 -- =====================================================================
 -- seed.sql - sample documentation tree
--- Run AFTER the migrations:  supabase db reset   (or paste in SQL editor)
 --
--- Note we never set path or depth: the triggers derive them. We also
--- never set slug for most rows, to exercise auto-slugification.
+-- RUN THIS *AFTER* CREATING YOUR FIRST ACCOUNT. Every page needs an
+-- owner, so the script adopts the oldest administrator (or, failing
+-- that, the oldest account) and gives them the sample pages. Register
+-- at /register first, promote yourself with
+--
+--     update public.profiles set role = 'admin' where email = 'you@example.com';
+--
+-- then run this file.
+--
+-- Note what is never set: path, depth and effective_visibility are all
+-- derived by trigger, and most rows omit slug too, to exercise
+-- auto-slugification. The tree demonstrates all three visibility
+-- levels, including a private page and a collaborative one.
 -- =====================================================================
 
 do $do$
 declare
   sd uuid; rl uuid; lb uuid; ca uuid; db uuid; ix uuid;
+  v_owner uuid;
 begin
 
+select id into v_owner from public.profiles
+ where role = 'admin' order by created_at limit 1;
+
+if v_owner is null then
+  select id into v_owner from public.profiles order by created_at limit 1;
+end if;
+
+if v_owner is null then
+  raise exception using
+    errcode = 'P0002',
+    message = 'No accounts exist yet, so the sample pages would have no owner.',
+    hint    = 'Register an account in the app first, then run seed.sql again.';
+end if;
+
 -- ============ System Design ==========================================
-insert into public.topics (parent_id, title, status, position, excerpt, content)
-values (null, 'System Design', 'published', 0,
+insert into public.topics (parent_id, owner_id, title, visibility, position, excerpt, content)
+values (null, v_owner, 'System Design', 'public', 0,
   'Foundational building blocks for designing large-scale systems.',
 $md$
 # System Design
@@ -41,8 +66,8 @@ $md$)
 returning id into sd;
 
 -- ---- Rate Limiter --------------------------------------------------
-insert into public.topics (parent_id, title, status, position, excerpt, content)
-values (sd, 'Rate Limiter', 'published', 0,
+insert into public.topics (parent_id, owner_id, title, visibility, position, excerpt, content)
+values (sd, v_owner, 'Rate Limiter', 'public', 0,
   'How to control the number of requests a client may make in a window.',
 $md$
 # Rate Limiter
@@ -78,8 +103,8 @@ The algorithms are covered in the child pages.
 $md$)
 returning id into rl;
 
-insert into public.topics (parent_id, title, status, position, excerpt, content) values
-(rl, 'Token Bucket', 'published', 0,
+insert into public.topics (parent_id, owner_id, title, visibility, position, excerpt, content) values
+(rl, v_owner, 'Token Bucket', 'public', 0,
  'A bucket refills at a steady rate; each request spends one token.',
 $md$
 # Token Bucket
@@ -135,7 +160,7 @@ function allow(bucket, cost = 1) {
 Compare with [Sliding Window](/system-design/rate-limiter/sliding-window),
 which trades burst tolerance for a smoother rate.
 $md$),
-(rl, 'Sliding Window', 'published', 1,
+(rl, v_owner, 'Sliding Window', 'public', 1,
  'Counts requests in a moving time window rather than a fixed one.',
 $md$
 # Sliding Window
@@ -162,7 +187,7 @@ def allow(previous_count, current_count, limit, elapsed_ratio):
 For an exact answer you need a sliding window **log**, which stores every
 timestamp and costs `O(n)` memory per client. Almost nobody needs that.
 $md$),
-(rl, 'Leaky Bucket', 'published', 2,
+(rl, v_owner, 'Leaky Bucket', 'public', 2,
  'Requests queue and drain at a constant rate, smoothing all bursts.',
 $md$
 # Leaky Bucket
@@ -192,8 +217,8 @@ third-party API with a hard per-second ceiling.
 $md$);
 
 -- ---- Load Balancer -------------------------------------------------
-insert into public.topics (parent_id, title, status, position, excerpt, content)
-values (sd, 'Load Balancer', 'published', 1,
+insert into public.topics (parent_id, owner_id, title, visibility, position, excerpt, content)
+values (sd, v_owner, 'Load Balancer', 'public', 1,
   'Distributing requests across a pool of healthy backends.',
 $md$
 # Load Balancer
@@ -210,8 +235,8 @@ incidents:
 $md$)
 returning id into lb;
 
-insert into public.topics (parent_id, title, status, position, excerpt, content) values
-(lb, 'Algorithms', 'published', 0,
+insert into public.topics (parent_id, owner_id, title, visibility, position, excerpt, content) values
+(lb, v_owner, 'Algorithms', 'public', 0,
  'Round robin, least connections, and consistent hashing compared.',
 $md$
 # Balancing Algorithms
@@ -233,7 +258,7 @@ keyspace — instead of remapping everything the way `hash(key) % n` does.
 *Virtual nodes* (placing each server at many ring positions) are what
 make the distribution actually even in practice.
 $md$),
-(lb, 'Health Checks', 'published', 1,
+(lb, v_owner, 'Health Checks', 'public', 1,
  'Active and passive probes, and why the two must disagree carefully.',
 $md$
 # Health Checks
@@ -269,8 +294,8 @@ already hit the failure.
 $md$);
 
 -- ---- Caching -------------------------------------------------------
-insert into public.topics (parent_id, title, status, position, excerpt, content)
-values (sd, 'Caching', 'published', 2,
+insert into public.topics (parent_id, owner_id, title, visibility, position, excerpt, content)
+values (sd, v_owner, 'Caching', 'public', 2,
   'Trading freshness for speed, and the invalidation bill that follows.',
 $md$
 # Caching
@@ -288,8 +313,8 @@ Everything else — eviction policy, key design, tiering — is detail.
 $md$)
 returning id into ca;
 
-insert into public.topics (parent_id, title, status, position, excerpt, content) values
-(ca, 'Cache Eviction', 'published', 0,
+insert into public.topics (parent_id, owner_id, title, visibility, position, excerpt, content) values
+(ca, v_owner, 'Cache Eviction', 'collaborative', 0,
  'LRU, LFU, and TTL: choosing what to throw away.',
 $md$
 # Cache Eviction
@@ -315,14 +340,15 @@ explain (analyze, buffers)
 select id, title from topics where path = 'system-design/caching';
 ```
 $md$),
-(ca, 'Redis', 'draft', 1,
+(ca, v_owner, 'Redis', 'private', 1,
  'When an external cache is worth its operational weight.',
 $md$
 # Redis
 
-*(This page is a draft — it is intentionally left unpublished so you can
-see that anonymous visitors get a 404 for it while an admin sees it in
-the dashboard. That difference is enforced by RLS, not by the UI.)*
+*(This page is **private**. Anonymous visitors get a 404 for it; its
+owner and administrators see it normally. That difference is enforced by
+Row Level Security in PostgreSQL, not by the user interface — try
+fetching it with curl and the anon key.)*
 
 Reach for Redis when you have demonstrated that:
 
@@ -335,8 +361,8 @@ to solve a problem you have not measured.
 $md$);
 
 -- ============ Database ===============================================
-insert into public.topics (parent_id, title, status, position, excerpt, content)
-values (null, 'Database', 'published', 1,
+insert into public.topics (parent_id, owner_id, title, visibility, position, excerpt, content)
+values (null, v_owner, 'Database', 'public', 1,
   'How relational databases store, find and protect your data.',
 $md$
 # Database
@@ -346,8 +372,8 @@ queries take a microsecond or a minute.
 $md$)
 returning id into db;
 
-insert into public.topics (parent_id, title, status, position, excerpt, content)
-values (db, 'Indexing', 'published', 0,
+insert into public.topics (parent_id, owner_id, title, visibility, position, excerpt, content)
+values (db, v_owner, 'Indexing', 'public', 0,
   'What an index is, when the planner will use one, and when it will not.',
 $md$
 # Indexing
@@ -380,8 +406,8 @@ order by pg_relation_size(indexrelid) desc;
 $md$)
 returning id into ix;
 
-insert into public.topics (parent_id, title, status, position, excerpt, content) values
-(ix, 'B-Tree', 'published', 0,
+insert into public.topics (parent_id, owner_id, title, visibility, position, excerpt, content) values
+(ix, v_owner, 'B-Tree', 'public', 0,
  'The default index type and the shape of nearly every lookup you make.',
 $md$
 # B-Tree
@@ -418,7 +444,7 @@ and `order by a, b`. It **cannot** serve `where b = 2` alone — the
 leading column is the only entry point. This is the single most common
 indexing mistake.
 $md$),
-(ix, 'GIN', 'published', 1,
+(ix, v_owner, 'GIN', 'public', 1,
  'The inverted index behind full-text search, JSONB and array containment.',
 $md$
 # GIN

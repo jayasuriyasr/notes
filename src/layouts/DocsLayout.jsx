@@ -18,7 +18,7 @@ import { SITE_NAME } from '../lib/config';
  */
 export function DocsLayout() {
   const { tree, isLoading, error, refetch } = useNavTree();
-  const { isAdmin } = useAuth();
+  const { session, profile, isAdmin } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const location = useLocation();
@@ -93,13 +93,36 @@ export function DocsLayout() {
 
           <ThemeToggle />
 
-          <Link
-            to={isAdmin ? '/admin' : '/login'}
-            className="rounded-lg px-3 py-1.5 text-sm font-medium text-zinc-600 hover:bg-zinc-100
-                       dark:text-zinc-400 dark:hover:bg-zinc-800"
-          >
-            {isAdmin ? 'Admin' : 'Sign in'}
-          </Link>
+          {session ? (
+            <Link
+              to="/dashboard"
+              className="flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium text-zinc-600
+                         hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+            >
+              <span className="grid h-6 w-6 place-items-center rounded-full bg-brand-100 text-[10px]
+                               font-bold uppercase text-brand-700 dark:bg-brand-500/20 dark:text-brand-300">
+                {(profile?.display_name || profile?.username || '?').slice(0, 2)}
+              </span>
+              <span className="hidden sm:inline">Dashboard</span>
+            </Link>
+          ) : (
+            <div className="flex items-center gap-1">
+              <Link
+                to="/login"
+                className="rounded-lg px-3 py-1.5 text-sm font-medium text-zinc-600 hover:bg-zinc-100
+                           dark:text-zinc-400 dark:hover:bg-zinc-800"
+              >
+                Sign in
+              </Link>
+              <Link
+                to="/register"
+                className="hidden rounded-lg bg-brand-600 px-3 py-1.5 text-sm font-medium text-white
+                           hover:bg-brand-700 sm:block"
+              >
+                Register
+              </Link>
+            </div>
+          )}
         </div>
       </header>
 

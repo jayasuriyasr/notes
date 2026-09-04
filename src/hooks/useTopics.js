@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query';
 import * as topics from '../services/topics';
+import * as admin from '../services/admin';
 import { buildTree } from '../utils/tree';
 
 /**
@@ -25,7 +26,9 @@ export const queryKeys = {
   page: (path) => ['page', path],
   redirect: (path) => ['redirect', path],
   search: (q) => ['search', q],
-  adminTree: ['admin-tree'],
+  myTopics: (uid) => ['my-topics', uid],
+  allTopics: ['all-topics'],
+  users: ['admin-users'],
   topic: (id) => ['topic', id],
   descendants: (id) => ['descendants', id],
 };
@@ -75,12 +78,52 @@ export function useSearch(query) {
   });
 }
 
-/* ---------------- admin ---------------- */
+/* ---------------- authoring ---------------- */
 
-export function useAdminTree(enabled = true) {
+/**
+ * The pages this member owns.
+ *
+ * Note that this returns a FOREST, not one tree: a member's pages are
+ * scattered through the site, so their dashboard is the set of pages
+ * they own, re-rooted. buildTree promotes any page whose parent is not
+ * in the set to a top-level entry, which is exactly the behaviour needed
+ * here — a page you own inside someone else's shared folder still
+ * appears, rather than vanishing because its parent is missing.
+ */
+export function useMyTopics(userId) {
   const query = useQuery({
-    queryKey: queryKeys.adminTree,
-    queryFn: topics.getAdminTree,
+    queryKey: queryKeys.myTopics(userId),
+    queryFn: () => topics.getMyTopics(userId),
+    enabled: Boolean(userId),
+    staleTime: 30 * 1000,
+  });
+  const tree = query.data ? buildTree(query.data) : [];
+  return { ...query, tree, flat: query.data ?? [] };
+}
+
+/**
+ * Sections this member may create a page inside: their own, plus
+ * anything marked "anyone can edit".
+ *
+ * Mirrors can_edit() in SQL. Not a security check — the INSERT policy
+ * answers the same question server-side — it is what stops the parent
+ * dropdown from listing sections the save would then bounce.
+ */
+export function useWritableParents(userId) {
+  const query = useQuery({
+    queryKey: ['writable-parents', userId],
+    queryFn: () => topics.getWritableParents(userId),
+    enabled: Boolean(userId),
+    staleTime: 30 * 1000,
+  });
+  return { ...query, tree: query.data ? buildTree(query.data) : [], flat: query.data ?? [] };
+}
+
+/** Every page in the system. Returns only what RLS allows — admins see all. */
+export function useAllTopics(enabled = true) {
+  const query = useQuery({
+    queryKey: queryKeys.allTopics,
+    queryFn: topics.getAllTopics,
     enabled,
     staleTime: 30 * 1000,
   });
@@ -117,7 +160,9 @@ export function useDescendantCount(id, enabled) {
 function useInvalidateAll() {
   const qc = useQueryClient();
   return () => {
-    qc.invalidateQueries({ queryKey: queryKeys.adminTree });
+    qc.invalidateQueries({ queryKey: ['my-topics'] });
+    qc.invalidateQueries({ queryKey: ['writable-parents'] });
+    qc.invalidateQueries({ queryKey: queryKeys.allTopics });
     qc.invalidateQueries({ queryKey: queryKeys.navTree });
     qc.invalidateQueries({ queryKey: ['page'] });
     qc.invalidateQueries({ queryKey: ['redirect'] });
@@ -133,7 +178,8 @@ export function useUpdateTopic() {
   const qc = useQueryClient();
   const invalidate = useInvalidateAll();
   return useMutation({
-    mutationFn: ({ id, ...input }) => topics.updateTopic(id, input),
+    mutationFn: ({ id, asCollaborator, ...input }) =>
+      topics.updateTopic(id, input, { asCollaborator }),
     onSuccess: (row) => {
       qc.setQueryData(queryKeys.topic(row.id), row);
       invalidate();
@@ -161,6 +207,58 @@ export function useReorderSiblings() {
   const invalidate = useInvalidateAll();
   return useMutation({
     mutationFn: ({ parentId, orderedIds }) => topics.reorderSiblings(parentId, orderedIds),
+    onSuccess: invalidate,
+  });
+}
+
+/* ---------------- administration ---------------- */
+
+export function useUsers(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.users,
+    queryFn: admin.listUsers,
+    enabled,
+    staleTime: 15 * 1000,
+  });
+}
+
+/**
+ * Every account mutation invalidates the user list AND the page trees.
+ *
+ * The page trees matter because these actions are not confined to the
+ * accounts table: deleting a member transfers every page they owned, and
+ * suspending one changes who may edit what. A user list that refreshed
+ * alone would leave the dashboard showing pages under the wrong owner.
+ */
+function useInvalidateUsers() {
+  const qc = useQueryClient();
+  return () => {
+    qc.invalidateQueries({ queryKey: queryKeys.users });
+    qc.invalidateQueries({ queryKey: ['my-topics'] });
+    qc.invalidateQueries({ queryKey: queryKeys.allTopics });
+  };
+}
+
+export function useSetUserRole() {
+  const invalidate = useInvalidateUsers();
+  return useMutation({
+    mutationFn: ({ userId, role }) => admin.setUserRole(userId, role),
+    onSuccess: invalidate,
+  });
+}
+
+export function useSetUserStatus() {
+  const invalidate = useInvalidateUsers();
+  return useMutation({
+    mutationFn: ({ userId, status }) => admin.setUserStatus(userId, status),
+    onSuccess: invalidate,
+  });
+}
+
+export function useDeleteUser() {
+  const invalidate = useInvalidateUsers();
+  return useMutation({
+    mutationFn: ({ userId }) => admin.deleteUser(userId),
     onSuccess: invalidate,
   });
 }

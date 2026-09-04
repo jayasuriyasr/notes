@@ -41,6 +41,23 @@ export function extractHeadings(markdown = '', { min = 2, max = 3 } = {}) {
 }
 
 /**
+ * Does this document open with its own level-1 heading?
+ *
+ * Most pages start with `# Title`, and rendering the stored title above
+ * that would duplicate it. A page that does not — someone wrote a
+ * paragraph and saved — would otherwise render with no visible title at
+ * all, leaving the breadcrumb as the only clue about what you are
+ * reading. Checking lets the page supply one only when it is missing.
+ */
+export function startsWithH1(markdown = '') {
+  const firstLine = String(markdown)
+    .replace(/^---[\s\S]*?---\s*/, '')     // front matter
+    .split('\n')
+    .find((line) => line.trim().length > 0);
+  return /^#\s+\S/.test(firstLine ?? '');
+}
+
+/**
  * Plain-text summary for <meta name="description"> when an author has not
  * written an explicit excerpt. Strips the Markdown rather than rendering
  * it, because a meta description containing "##" looks broken in results.

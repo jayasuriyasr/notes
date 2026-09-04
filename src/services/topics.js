@@ -25,8 +25,9 @@ import { normalizePath } from '../utils/slug';
 /** Columns needed to draw navigation. Note the absence of `content`. */
 const NAV_COLUMNS = 'id,parent_id,title,slug,path,depth,position';
 
-/** Columns for the admin tree — adds the bits the dashboard displays. */
-const ADMIN_COLUMNS = `${NAV_COLUMNS},status,updated_at,created_at,published_at`;
+/** Columns for the authoring trees — adds what the dashboard displays. */
+const MANAGE_COLUMNS =
+  `${NAV_COLUMNS},visibility,effective_visibility,owner_id,updated_at,created_at,published_at`;
 
 /* ============================================================
  * PUBLIC READS
@@ -36,19 +37,25 @@ const ADMIN_COLUMNS = `${NAV_COLUMNS},status,updated_at,created_at,published_at`
  * The whole published tree, flat.
  *
  * Operation : Get complete navigation tree
- * Query     : select ... from topics where status='published' order by path
+ * Query     : select ... from topics where effective_visibility <> 'private'
  * Returns   : [{ id, parent_id, title, slug, path, depth, position }]
  *
- * RLS supplies the `status='published'` filter for anonymous callers, but
- * we state it explicitly anyway: an admin is signed in and WOULD see
- * drafts here, and drafts must not appear in the public sidebar.
+ * The filter is stated explicitly even though RLS would apply it for an
+ * anonymous caller, because a signed-in one sees more: an administrator
+ * would otherwise get every member's private pages in the public
+ * sidebar, and a member would get their own. Private pages belong in the
+ * dashboard, not in the site navigation — though navigating straight to
+ * one's URL still works, since RLS allows the read.
+ *
+ * Note `effective_visibility`, not `visibility`: a public page inside a
+ * private folder is private, and only the derived column knows that.
  */
 export async function getNavigationTree() {
   return unwrap(
     await supabase
       .from('topics')
       .select(NAV_COLUMNS)
-      .eq('status', 'published')
+      .neq('effective_visibility', 'private')
       .order('path', { ascending: true }),
   );
 }
@@ -78,6 +85,12 @@ export async function getTopicByPath(path) {
     topic: data.topic,
     breadcrumbs: data.breadcrumbs ?? [],
     children: data.children ?? [],
+    // Answered by the database in the same round trip, so the page can
+    // decide whether to offer an edit link without a second request —
+    // and so that what it offers matches what a save would actually be
+    // allowed to do.
+    canEdit: Boolean(data.can_edit),
+    isOwner: Boolean(data.is_owner),
   };
 }
 
@@ -96,7 +109,7 @@ export async function getTopicChildren(parentId) {
       .from('topics')
       .select(`${NAV_COLUMNS},excerpt`)
       .eq('parent_id', parentId)
-      .eq('status', 'published')
+      .neq('effective_visibility', 'private')
       .order('position', { ascending: true }),
   );
 }
@@ -136,14 +149,14 @@ export async function resolveRedirect(path) {
   const rows = unwrap(
     await supabase
       .from('topic_redirects')
-      .select('topic_id, topics!inner(path,status)')
+      .select('topic_id, topics!inner(path,effective_visibility)')
       .eq('old_path', clean)
       .limit(1),
   );
   const target = rows?.[0]?.topics;
-  // A redirect to a draft (or to a page an anonymous visitor may not see)
-  // is filtered out by RLS on the joined table and lands here as null,
-  // which correctly produces a 404 rather than leaking the target.
+  // A redirect whose target the caller may not see is filtered out by
+  // RLS on the joined table and arrives here as null, producing a 404
+  // rather than confirming that the page exists.
   return target?.path ?? null;
 }
 
@@ -164,7 +177,7 @@ export async function getAllPublishedPaths() {
     await supabase
       .from('topics')
       .select('path,updated_at')
-      .eq('status', 'published')
+      .neq('effective_visibility', 'private')
       .order('path', { ascending: true }),
   );
 }
@@ -173,10 +186,32 @@ export async function getAllPublishedPaths() {
  * ADMIN READS
  * ============================================================ */
 
-/** The full tree including drafts. Returns [] for non-admins (RLS). */
-export async function getAdminTree() {
+/**
+ * The pages this member owns — the dashboard's tree.
+ *
+ * The `owner_id` filter is not a security measure (RLS already hides
+ * other people's private pages); it is what makes the dashboard *your*
+ * dashboard rather than a list of everything you happen to be able to
+ * read.
+ */
+export async function getMyTopics(userId) {
+  if (!userId) return [];
   return unwrap(
-    await supabase.from('topics').select(ADMIN_COLUMNS).order('path', { ascending: true }),
+    await supabase
+      .from('topics')
+      .select(MANAGE_COLUMNS)
+      .eq('owner_id', userId)
+      .order('path', { ascending: true }),
+  );
+}
+
+/** Every page in the system, private ones included. Admin-only via RLS. */
+export async function getAllTopics() {
+  return unwrap(
+    await supabase
+      .from('topics')
+      .select(`${MANAGE_COLUMNS},public_profiles!topics_owner_id_fkey(username)`)
+      .order('path', { ascending: true }),
   );
 }
 
@@ -184,12 +219,37 @@ export async function getTopicById(id) {
   const rows = unwrap(
     await supabase
       .from('topics')
-      .select(`${ADMIN_COLUMNS},content,excerpt`)
+      .select(`${MANAGE_COLUMNS},content,excerpt`)
       .eq('id', id)
       .limit(1),
   );
   if (!rows?.length) throw new AppError(ERROR_KIND.NOT_FOUND, 'That page does not exist.');
   return rows[0];
+}
+
+/**
+ * Sections this member may put a new page inside: their own, plus
+ * anything marked "anyone can edit".
+ *
+ * Mirrors can_edit() in SQL. It is not a security check — the INSERT
+ * policy re-answers the same question server-side — it is what stops the
+ * parent dropdown from listing sections the save would then bounce.
+ */
+export async function getWritableParents(userId) {
+  if (!userId) return [];
+  return unwrap(
+    await supabase
+      .from('topics')
+      .select(`${NAV_COLUMNS},visibility,effective_visibility,owner_id`)
+      .or(`owner_id.eq.${userId},effective_visibility.eq.collaborative`)
+      .order('path', { ascending: true }),
+  );
+}
+
+/** Whether the current user may edit this page, answered by the database. */
+export async function canEdit(id) {
+  if (!id) return false;
+  return Boolean(unwrap(await supabase.rpc('can_edit', { p_topic_id: id })));
 }
 
 export async function descendantCount(id) {
@@ -206,50 +266,73 @@ export async function descendantCount(id) {
  * or forge authorship.
  */
 
-const writable = ({ title, slug, content, excerpt, status, parent_id, position }) => ({
+const writable = ({ title, slug, content, excerpt, visibility, parent_id, position }) => ({
   ...(title !== undefined && { title }),
   ...(slug !== undefined && { slug: slug || null }),
   ...(content !== undefined && { content }),
   ...(excerpt !== undefined && { excerpt: excerpt || null }),
-  ...(status !== undefined && { status }),
+  ...(visibility !== undefined && { visibility }),
   ...(parent_id !== undefined && { parent_id: parent_id || null }),
   ...(position !== undefined && { position }),
 });
 
 /**
+ * What a COLLABORATOR may send.
+ *
+ * On a page marked "anyone can edit", any active member can update the
+ * row — but the database refuses a request that would also rename it,
+ * move it, change who can see it, or transfer ownership. Sending only
+ * these three fields means an ordinary save never trips that guard, and
+ * the UI never offers a control the database would reject.
+ */
+const editableText = ({ title, content, excerpt }) => ({
+  ...(title !== undefined && { title }),
+  ...(content !== undefined && { content }),
+  ...(excerpt !== undefined && { excerpt: excerpt || null }),
+});
+
+/**
  * Operation : Create topic
  * Query     : insert into topics (...) values (...) returning *
- * Note      : omitting `slug` makes the trigger derive it from the title
- *             and de-duplicate it against siblings automatically.
+ *
+ * Two things are deliberately NOT sent: `owner_id`, because the trigger
+ * sets it from the JWT and discards whatever the client claims, and
+ * `path`, which is derived. Omitting `slug` makes the trigger derive it
+ * from the title and de-duplicate it against siblings.
  */
 export async function createTopic(input) {
   const rows = unwrap(
     await supabase
       .from('topics')
       .insert(writable(input))
-      .select(`${ADMIN_COLUMNS},content,excerpt`),
+      .select(`${MANAGE_COLUMNS},content,excerpt`),
   );
   if (!rows?.length) {
-    throw new AppError(ERROR_KIND.FORBIDDEN, 'The page was not created. Administrator access is required.');
+    throw new AppError(
+      ERROR_KIND.FORBIDDEN,
+      'The page was not created. You can add pages to your own sections and to any section marked "anyone can edit".',
+    );
   }
   return rows[0];
 }
 
 /**
- * Operation : Update topic (title, slug, Markdown, summary, status)
+ * Operation : Update topic (title, slug, Markdown, summary, visibility)
  * Query     : update topics set ... where id = $1 returning *
  *
  * An empty result means RLS matched no row — i.e. the caller is not an
  * admin. PostgREST reports that as success with zero rows, not as an
  * error, so we convert it into one rather than showing a silent no-op.
  */
-export async function updateTopic(id, input) {
+export async function updateTopic(id, input, { asCollaborator = false } = {}) {
+  const payload = asCollaborator ? editableText(input) : writable(input);
+
   const rows = unwrap(
     await supabase
       .from('topics')
-      .update(writable(input))
+      .update(payload)
       .eq('id', id)
-      .select(`${ADMIN_COLUMNS},content,excerpt`),
+      .select(`${MANAGE_COLUMNS},content,excerpt`),
   );
   if (!rows?.length) {
     throw new AppError(
@@ -260,9 +343,17 @@ export async function updateTopic(id, input) {
   return rows[0];
 }
 
-/** Operation : Publish / unpublish */
-export async function publishTopic(id, published) {
-  return updateTopic(id, { status: published ? 'published' : 'draft' });
+/**
+ * Operation : Change who can see or edit a page
+ * Values    : 'private' | 'public' | 'collaborative'
+ *
+ * The change propagates: switching a section to private makes its whole
+ * subtree effectively private, in one recursive statement inside the
+ * database. Switching it back restores each descendant to its own
+ * setting — a page that was independently private stays private.
+ */
+export async function setVisibility(id, visibility) {
+  return updateTopic(id, { visibility });
 }
 
 /**

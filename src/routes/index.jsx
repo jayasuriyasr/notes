@@ -7,18 +7,20 @@ import RouteError from '../pages/RouteError';
 import { Spinner } from '../components/ui/Spinner';
 
 /**
- * The admin surface is code-split. A reader who never signs in should not
- * download the Markdown editor, the dialogs or the admin tree — together
- * the largest application chunk in the project. React.lazy defers all of
- * it until someone actually navigates to /admin or /login.
+ * The authoring surface is code-split. Someone who only ever reads the
+ * documentation should not download the Markdown editor, the dialogs,
+ * the tree manager or the people table — together the largest
+ * application chunk in the project.
  */
-const AdminLayout = lazy(() => import('../layouts/AdminLayout'));
-const RequireAdmin = lazy(() =>
-  import('../layouts/AdminLayout').then((m) => ({ default: m.RequireAdmin })),
+const DashboardLayout = lazy(() => import('../layouts/DashboardLayout'));
+const RequireMember = lazy(() =>
+  import('../layouts/DashboardLayout').then((m) => ({ default: m.RequireMember })),
 );
-const LoginPage = lazy(() => import('../pages/LoginPage'));
-const AdminTopics = lazy(() => import('../pages/admin/AdminTopics'));
-const AdminEditor = lazy(() => import('../pages/admin/AdminEditor'));
+const AuthPage = lazy(() => import('../pages/AuthPage'));
+const MyPages = lazy(() => import('../pages/dashboard/MyPages'));
+const AllPages = lazy(() => import('../pages/dashboard/AllPages'));
+const People = lazy(() => import('../pages/dashboard/People'));
+const Editor = lazy(() => import('../pages/dashboard/Editor'));
 
 const deferred = (node) => (
   <Suspense
@@ -36,56 +38,67 @@ const deferred = (node) => (
  * ============================================================
  *  ROUTING
  * ============================================================
- * Two families of route, and one wildcard.
+ * Three families of route, and one wildcard.
  *
- *   /login, /admin/*    — fixed, application-owned routes
- *   /*                  — everything else is a documentation path
+ *   /login, /register   authentication
+ *   /dashboard/*        authoring, for any signed-in member
+ *   /*                  everything else is a documentation path
  *
  * The wildcard is what makes URLs content-driven: `/a/b/c` arrives as a
- * single string, gets looked up by `path`, and renders. Publishing a new
- * page makes its URL live immediately — no route table to update, no
- * rebuild, no deploy.
+ * single string, becomes one indexed lookup on `path`, and renders.
+ * Publishing a page makes its URL live immediately — no route table to
+ * update, no rebuild, no deploy.
  *
- * Route ranking, not declaration order, decides the winner: React Router
- * scores static segments above dynamic ones and dynamic above splats, so
- * `/login` can never be swallowed by `/*`. The reserved-slug CHECK
- * constraint in the database closes the other half of the problem — an
- * author cannot create a top-level page at `admin` and shadow the
- * dashboard.
+ * Route RANKING, not declaration order, decides the winner: React Router
+ * scores static segments above dynamic and dynamic above splats, so
+ * /login can never be swallowed by /*. The reserved-slug CHECK
+ * constraint closes the other half of the problem — now that any member
+ * can create a top-level page, someone would otherwise be able to claim
+ * `dashboard` or `register` and shadow the application.
  *
- * A path that matches no topic is NOT immediately a 404: DocPage first
- * consults topic_redirects, so a page that was renamed or moved forwards
- * to its new home instead of dead-ending.
+ * A path that matches no page is NOT immediately a 404: DocPage consults
+ * topic_redirects first, so a page that was renamed or moved forwards to
+ * its new home.
  */
 export const router = createBrowserRouter([
+  { path: '/login',    element: deferred(<AuthPage mode="login" />),    errorElement: <RouteError /> },
+  { path: '/register', element: deferred(<AuthPage mode="register" />), errorElement: <RouteError /> },
+
   {
-    path: '/login',
-    element: deferred(<LoginPage />),
-    errorElement: <RouteError />,
-  },
-  {
-    path: '/admin',
+    path: '/dashboard',
     element: deferred(
-      <RequireAdmin>
-        <AdminLayout />
-      </RequireAdmin>,
+      <RequireMember>
+        <DashboardLayout />
+      </RequireMember>,
     ),
     errorElement: <RouteError />,
     children: [
-      { index: true, element: deferred(<AdminTopics />) },
-      { path: 'topics', element: <Navigate to="/admin" replace /> },
-      { path: 'topics/new', element: deferred(<AdminEditor />) },
-      { path: 'topics/:id', element: deferred(<AdminEditor />) },
+      { index: true, element: deferred(<MyPages />) },
+      { path: 'pages/new', element: deferred(<Editor />) },
+      { path: 'pages/:id', element: deferred(<Editor />) },
+      {
+        path: 'all',
+        element: deferred(<RequireMember adminOnly><AllPages /></RequireMember>),
+      },
+      {
+        path: 'people',
+        element: deferred(<RequireMember adminOnly><People /></RequireMember>),
+      },
     ],
   },
+
+  // The dashboard used to live at /admin. Kept so older links and
+  // bookmarks land somewhere useful instead of resolving as a page.
+  { path: '/admin', element: <Navigate to="/dashboard" replace /> },
+  { path: '/admin/*', element: <Navigate to="/dashboard" replace /> },
+
   {
     path: '/',
     element: <DocsLayout />,
     errorElement: <RouteError />,
     children: [
       { index: true, element: <HomePage /> },
-      // The splat. Must be last within this branch.
-      { path: '*', element: <DocPage /> },
+      { path: '*', element: <DocPage /> },   // the splat; must be last
     ],
   },
 ]);
