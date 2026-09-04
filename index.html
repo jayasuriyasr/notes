@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en" class="scroll-smooth">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <!-- Fallback metadata. These are what a non-JavaScript client sees:
+         social crawlers (Slack, Twitter/X, LinkedIn) read the raw HTML and
+         never run React. React 19 hoists per-page tags into <head> at
+         runtime; <Seo> then removes these two so the live DOM holds
+         exactly one title and one description rather than two of each. -->
+    <title data-default>Documentation</title>
+    <meta data-default name="description" content="Technical documentation." />
+    <meta data-default property="og:title" content="Documentation" />
+    <meta data-default property="og:description" content="Technical documentation." />
+    <script>
+      // Applied before first paint so a dark-mode reader never sees a
+      // white flash. Must stay inline and synchronous for that reason.
+      (function () {
+        try {
+          var t = localStorage.getItem('theme');
+          var dark = t === 'dark' || (!t && matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.classList.toggle('dark', dark);
+        } catch (_) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

@@ -1,0 +1,141 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/* Class-based dark mode: the inline script in index.html sets .dark on
+   <html> before first paint, and ThemeToggle flips it at runtime. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  --color-brand-50:  oklch(0.97 0.014 285);
+  --color-brand-100: oklch(0.93 0.03 285);
+  --color-brand-400: oklch(0.68 0.16 277);
+  --color-brand-500: oklch(0.59 0.20 277);
+  --color-brand-600: oklch(0.51 0.22 277);
+  --color-brand-700: oklch(0.45 0.20 277);
+
+  /* Tailwind's built-in container scale stops at 7xl (80rem). A docs
+     layout is sidebar + prose + table of contents, which needs a little
+     more before the prose column starts to feel cramped. */
+  --container-8xl: 90rem;
+}
+
+@layer base {
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    @apply bg-white text-zinc-800 antialiased;
+    @apply dark:bg-zinc-950 dark:text-zinc-300;
+    font-family: var(--font-sans);
+  }
+
+  /* Anchored headings must not hide under the sticky header. */
+  :target { scroll-margin-top: 6rem; }
+
+  ::selection { @apply bg-brand-500/25; }
+
+  /* Visible focus for keyboard users, invisible for mouse users. */
+  :focus-visible { @apply outline-2 outline-offset-2 outline-brand-500; }
+
+  /* A slim scrollbar for the sidebar and code blocks. */
+  .thin-scrollbar { scrollbar-width: thin; scrollbar-color: var(--color-zinc-300) transparent; }
+  .dark .thin-scrollbar { scrollbar-color: var(--color-zinc-700) transparent; }
+}
+
+/* =====================================================================
+   Documentation typography
+   Tailwind's `prose` gets us 90% of the way; these overrides fix the
+   parts that matter for technical writing: code blocks that scroll
+   rather than overflow, tables with real borders, and quieter inline
+   code than the default.
+   ===================================================================== */
+@layer components {
+  .doc-prose {
+    @apply prose prose-zinc max-w-none dark:prose-invert;
+    @apply prose-headings:scroll-mt-24 prose-headings:font-semibold;
+    @apply prose-h1:text-3xl prose-h1:tracking-tight prose-h1:mb-3;
+    @apply prose-h2:mt-12 prose-h2:pb-2 prose-h2:border-b prose-h2:border-zinc-200 dark:prose-h2:border-zinc-800;
+    @apply prose-a:text-brand-600 prose-a:font-medium prose-a:no-underline hover:prose-a:underline;
+    @apply dark:prose-a:text-brand-400;
+    @apply prose-img:rounded-lg prose-img:border prose-img:border-zinc-200 dark:prose-img:border-zinc-800;
+    @apply prose-blockquote:not-italic prose-blockquote:border-l-brand-500;
+    @apply prose-blockquote:text-zinc-600 dark:prose-blockquote:text-zinc-400;
+  }
+
+  /* Inline code: `like this`. Tailwind adds ` ` quote marks by default. */
+  .doc-prose :not(pre) > code {
+    @apply rounded border border-zinc-200 bg-zinc-100 px-1.5 py-0.5 text-[0.85em] font-normal;
+    @apply dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200;
+  }
+  .doc-prose :not(pre) > code::before,
+  .doc-prose :not(pre) > code::after { content: none; }
+
+  .doc-prose pre {
+    @apply overflow-x-auto rounded-lg border border-zinc-200 bg-zinc-50 p-4 text-[0.875em];
+    @apply dark:border-zinc-800 dark:bg-zinc-900/70;
+  }
+  .doc-prose pre code { @apply bg-transparent p-0 text-zinc-800 dark:text-zinc-200; }
+
+  /* Wide tables scroll inside their own box instead of blowing out the page. */
+  .doc-prose .table-scroll { @apply -mx-1 overflow-x-auto px-1; }
+  .doc-prose table { @apply w-full text-sm; }
+  .doc-prose thead th {
+    @apply border-b-2 border-zinc-200 pb-2 text-left font-semibold dark:border-zinc-700;
+  }
+  .doc-prose tbody td { @apply border-b border-zinc-100 py-2 align-top dark:border-zinc-800/70; }
+
+  .doc-prose hr { @apply border-zinc-200 dark:border-zinc-800; }
+}
+
+/* =====================================================================
+   Syntax highlighting
+   rehype-highlight emits highlight.js class names. Rather than shipping
+   two full highlight.js themes and fighting over which one wins, we map
+   the token classes onto CSS custom properties and swap the properties
+   in dark mode. ~30 lines instead of ~600, and it inherits the palette.
+   ===================================================================== */
+:root {
+  --hl-comment: #6b7280;
+  --hl-keyword: #7c3aed;
+  --hl-string:  #047857;
+  --hl-number:  #b45309;
+  --hl-title:   #1d4ed8;
+  --hl-attr:    #be185d;
+  --hl-type:    #0e7490;
+  --hl-deleted: #b91c1c;
+}
+.dark {
+  --hl-comment: #71717a;
+  --hl-keyword: #c4b5fd;
+  --hl-string:  #6ee7b7;
+  --hl-number:  #fcd34d;
+  --hl-title:   #93c5fd;
+  --hl-attr:    #f9a8d4;
+  --hl-type:    #67e8f9;
+  --hl-deleted: #fca5a5;
+}
+
+.hljs-comment, .hljs-quote { color: var(--hl-comment); font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-doctag,
+.hljs-meta .hljs-keyword { color: var(--hl-keyword); }
+.hljs-string, .hljs-regexp, .hljs-addition, .hljs-meta .hljs-string { color: var(--hl-string); }
+.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-link { color: var(--hl-number); }
+.hljs-title, .hljs-title.function_, .hljs-section, .hljs-name { color: var(--hl-title); }
+.hljs-attr, .hljs-attribute, .hljs-variable, .hljs-template-variable,
+.hljs-selector-attr, .hljs-selector-pseudo { color: var(--hl-attr); }
+.hljs-type, .hljs-built_in, .hljs-class .hljs-title, .hljs-params { color: var(--hl-type); }
+.hljs-deletion { color: var(--hl-deleted); }
+.hljs-strong { font-weight: 600; }
+.hljs-emphasis { font-style: italic; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
